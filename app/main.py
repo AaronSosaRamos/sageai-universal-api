@@ -5,10 +5,13 @@ from typing import Dict, Optional
 from .config import get_settings
 from .security import create_access_token
 from .auth import verify_token_dependency
-from .supervisor import get_supervisor_response
+from .supervisor import get_supervisor_response, get_assistant_chat_response
 from .db.user_management import UserRepository, UserCreate
 from .db.thread_manager import ThreadManager, ThreadCreate
 from .db.chat_management import ChatThreadRepository
+from .db.custom_space_management import CustomSpaceRepository, CustomSpaceCreate, CustomSpaceUpdate
+from .db.assistant_management import AssistantRepository, AssistantCreate, AssistantUpdate
+from .assistant_prompt_generator import generate_system_prompt_from_files
 from .security import verify_token
 
 # pip install fastapi uvicorn python-multipart
@@ -294,7 +297,6 @@ class UserRegistrationRequest(BaseModel):
     apellido: constr(min_length=2, max_length=50)
     email: EmailStr
     password: constr(min_length=8, max_length=50)
-    security_code: str
 
     class Config:
         json_schema_extra = {
@@ -302,15 +304,115 @@ class UserRegistrationRequest(BaseModel):
                 "nombre": "Juan",
                 "apellido": "Pérez",
                 "email": "juan.perez@example.com",
-                "password": "contraseña123",
-                "security_code": "ABC123"
+                "password": "contraseña123"
             }
         }
+
+
+# ---------- Custom Space Models ----------
+class CustomSpaceCreateRequest(BaseModel):
+    title: str = "Mi Espacio Personalizado"
+    custom_memories: str = ""
+    agent_instructions: str = ""
+    is_active: bool = True
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "title": "Mi Espacio de Trabajo",
+                "custom_memories": "Soy desarrollador Python. Me gusta trabajar con FastAPI y React.",
+                "agent_instructions": "Sé conciso y técnico. Usa ejemplos de código cuando sea relevante.",
+                "is_active": True
+            }
+        }
+
+
+class CustomSpaceUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    custom_memories: Optional[str] = None
+    agent_instructions: Optional[str] = None
+    is_active: Optional[bool] = None
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "title": "Mi Espacio Actualizado",
+                "custom_memories": "Memorias actualizadas...",
+                "agent_instructions": "Instrucciones actualizadas...",
+                "is_active": True
+            }
+        }
+
+
+class CustomSpaceResponse(BaseModel):
+    id: str
+    user_id: str
+    title: str
+    custom_memories: str
+    agent_instructions: str
+    is_active: bool
+    created_at: str
+    updated_at: str
+
+
+# ---------- Assistant Models ----------
+class AssistantCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+    system_prompt: str
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "name": "Asistente de Ventas",
+                "description": "Especializado en consultas comerciales",
+                "system_prompt": "Eres un asistente de ventas experto..."
+            }
+        }
+
+
+class AssistantUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    system_prompt: Optional[str] = None
+
+
+class AssistantResponse(BaseModel):
+    id: str
+    user_id: str
+    name: str
+    description: str
+    system_prompt: str
+    created_at: str
+    updated_at: str
+
+
+class GeneratePromptRequest(BaseModel):
+    file_refs: List[str]  # ["session_uuid/inner_uuid/filename", ...]
+    user_hint: str = ""
+
+
+class AssistantChatRequest(BaseModel):
+    query: str
+    assistant_id: str
 
 
 @app.get("/")
 async def root():
     return {"message": f"Welcome to {settings.app_name} API"}
+
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint para mantener la API activa y verificar su estado.
+    Endpoint rápido sin autenticación requerida.
+    """
+    return {
+        "status": "ok",
+        "service": settings.app_name,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
 
 
 @app.post("/token")
@@ -426,21 +528,6 @@ async def create_user(request: UserRegistrationRequest) -> Dict[str, str]:
         HTTPException: Si el email ya está registrado o hay otros errores
     """
     try:
-        # Verificar el security code
-        code_meta = security_codes.get(request.security_code)
-        if not code_meta:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Código de seguridad inválido"
-            )
-        
-        if code_meta["expires_at"] < datetime.utcnow():
-            security_codes.pop(request.security_code, None)
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Código de seguridad expirado"
-            )
-        
         # Crear repositorio
         user_repo = UserRepository()
         
@@ -459,9 +546,6 @@ async def create_user(request: UserRegistrationRequest) -> Dict[str, str]:
             email=request.email,
             password=request.password
         ))
-        
-        # Eliminar el código usado
-        security_codes.pop(request.security_code, None)
         
         return {
             "message": "Usuario creado exitosamente",
@@ -532,6 +616,440 @@ async def supervisor_endpoint(request: SupervisorRequest) -> Dict[str, str]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error al procesar la solicitud: {str(e)}"
         )
+
+
+@app.post("/assistant-chat", dependencies=[Depends(verify_token_dependency)])
+async def assistant_chat_endpoint(
+    request: AssistantChatRequest,
+    payload: dict = Depends(verify_token_dependency)
+) -> Dict[str, str]:
+    """
+    Chat con un asistente personalizado. Usa el system prompt del asistente,
+    sin herramientas. Historial por asistente.
+    """
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+
+    assistant_repo = AssistantRepository()
+    assistant = assistant_repo.get(request.assistant_id)
+    if not assistant or assistant.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Asistente no encontrado")
+
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="La consulta no puede estar vacía")
+
+    try:
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            get_assistant_chat_response,
+            request.query,
+            user_id,
+            str(request.assistant_id),
+            assistant.system_prompt or ""
+        )
+        return {"response": response}
+    except Exception as e:
+        print(f"Error en assistant_chat_endpoint: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+# ---------- Custom Space Endpoints ----------
+@app.post("/custom-spaces", status_code=status.HTTP_201_CREATED, dependencies=[Depends(verify_token_dependency)])
+async def create_custom_space(
+    request: CustomSpaceCreateRequest,
+    payload: dict = Depends(verify_token_dependency)
+) -> CustomSpaceResponse:
+    """
+    Crea un nuevo espacio personalizado para el usuario autenticado.
+    """
+    try:
+        # Obtener user_id del payload
+        user_id = payload.get("user_id")
+        
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token inválido o sin user_id"
+            )
+        
+        # Crear espacio
+        space_repo = CustomSpaceRepository()
+        space = space_repo.create_space(CustomSpaceCreate(
+            user_id=user_id,
+            title=request.title,
+            custom_memories=request.custom_memories,
+            agent_instructions=request.agent_instructions,
+            is_active=request.is_active
+        ))
+        
+        return CustomSpaceResponse(
+            id=str(space.id),
+            user_id=space.user_id,
+            title=space.title,
+            custom_memories=space.custom_memories,
+            agent_instructions=space.agent_instructions,
+            is_active=space.is_active,
+            created_at=space.created_at.isoformat(),
+            updated_at=space.updated_at.isoformat()
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error al crear espacio personalizado: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al crear espacio personalizado: {str(e)}"
+        )
+
+
+@app.get("/custom-spaces", dependencies=[Depends(verify_token_dependency)])
+async def get_user_custom_spaces(
+    active_only: bool = False,
+    payload: dict = Depends(verify_token_dependency)
+) -> List[CustomSpaceResponse]:
+    """
+    Obtiene todos los espacios personalizados del usuario autenticado.
+    """
+    try:
+        # Obtener user_id del payload
+        user_id = payload.get("user_id")
+        
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token inválido o sin user_id"
+            )
+        
+        # Obtener espacios
+        space_repo = CustomSpaceRepository()
+        spaces = space_repo.get_user_spaces(user_id, active_only=active_only)
+        
+        return [
+            CustomSpaceResponse(
+                id=str(space.id),
+                user_id=space.user_id,
+                title=space.title,
+                custom_memories=space.custom_memories,
+                agent_instructions=space.agent_instructions,
+                is_active=space.is_active,
+                created_at=space.created_at.isoformat(),
+                updated_at=space.updated_at.isoformat()
+            )
+            for space in spaces
+        ]
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error al obtener espacios personalizados: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al obtener espacios personalizados: {str(e)}"
+        )
+
+
+@app.get("/custom-spaces/{space_id}", dependencies=[Depends(verify_token_dependency)])
+async def get_custom_space(
+    space_id: str,
+    payload: dict = Depends(verify_token_dependency)
+) -> CustomSpaceResponse:
+    """
+    Obtiene un espacio personalizado específico por su ID.
+    """
+    try:
+        # Obtener user_id del payload
+        user_id = payload.get("user_id")
+        
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token inválido o sin user_id"
+            )
+        
+        # Obtener espacio
+        space_repo = CustomSpaceRepository()
+        space = space_repo.get_space(space_id)
+        
+        if not space:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Espacio personalizado no encontrado"
+            )
+        
+        # Verificar que el espacio pertenece al usuario
+        if space.user_id != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No tienes permiso para acceder a este espacio"
+            )
+        
+        return CustomSpaceResponse(
+            id=str(space.id),
+            user_id=space.user_id,
+            title=space.title,
+            custom_memories=space.custom_memories,
+            agent_instructions=space.agent_instructions,
+            is_active=space.is_active,
+            created_at=space.created_at.isoformat(),
+            updated_at=space.updated_at.isoformat()
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error al obtener espacio personalizado: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al obtener espacio personalizado: {str(e)}"
+        )
+
+
+@app.put("/custom-spaces/{space_id}", dependencies=[Depends(verify_token_dependency)])
+async def update_custom_space(
+    space_id: str,
+    request: CustomSpaceUpdateRequest,
+    payload: dict = Depends(verify_token_dependency)
+) -> CustomSpaceResponse:
+    """
+    Actualiza un espacio personalizado existente.
+    """
+    try:
+        # Obtener user_id del payload
+        user_id = payload.get("user_id")
+        
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token inválido o sin user_id"
+            )
+        
+        # Verificar que el espacio existe y pertenece al usuario
+        space_repo = CustomSpaceRepository()
+        space = space_repo.get_space(space_id)
+        
+        if not space:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Espacio personalizado no encontrado"
+            )
+        
+        if space.user_id != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No tienes permiso para modificar este espacio"
+            )
+        
+        # Actualizar espacio
+        updated_space = space_repo.update_space(space_id, CustomSpaceUpdate(
+            title=request.title,
+            custom_memories=request.custom_memories,
+            agent_instructions=request.agent_instructions,
+            is_active=request.is_active
+        ))
+        
+        return CustomSpaceResponse(
+            id=str(updated_space.id),
+            user_id=updated_space.user_id,
+            title=updated_space.title,
+            custom_memories=updated_space.custom_memories,
+            agent_instructions=updated_space.agent_instructions,
+            is_active=updated_space.is_active,
+            created_at=updated_space.created_at.isoformat(),
+            updated_at=updated_space.updated_at.isoformat()
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error al actualizar espacio personalizado: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al actualizar espacio personalizado: {str(e)}"
+        )
+
+
+@app.delete("/custom-spaces/{space_id}", dependencies=[Depends(verify_token_dependency)])
+async def delete_custom_space(
+    space_id: str,
+    payload: dict = Depends(verify_token_dependency)
+) -> Dict[str, str]:
+    """
+    Elimina un espacio personalizado.
+    """
+    try:
+        # Obtener user_id del payload
+        user_id = payload.get("user_id")
+        
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token inválido o sin user_id"
+            )
+        
+        # Verificar que el espacio existe y pertenece al usuario
+        space_repo = CustomSpaceRepository()
+        space = space_repo.get_space(space_id)
+        
+        if not space:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Espacio personalizado no encontrado"
+            )
+        
+        if space.user_id != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No tienes permiso para eliminar este espacio"
+            )
+        
+        # Eliminar espacio
+        space_repo.delete_space(space_id)
+        
+        return {
+            "message": "Espacio personalizado eliminado exitosamente",
+            "space_id": space_id
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error al eliminar espacio personalizado: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al eliminar espacio personalizado: {str(e)}"
+        )
+
+
+# ---------- Assistant Endpoints ----------
+@app.post("/assistants/generate-prompt", dependencies=[Depends(verify_token_dependency)])
+async def generate_assistant_prompt(
+    request: GeneratePromptRequest,
+    payload: dict = Depends(verify_token_dependency)
+) -> Dict[str, str]:
+    """Genera un system prompt a partir de archivos subidos."""
+    try:
+        user_id = payload.get("user_id")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Token inválido")
+
+
+        file_paths = []
+        for ref in request.file_refs:
+            parts = ref.split("/")
+            if len(parts) != 3:
+                continue
+            session_uuid, inner_uuid, filename = parts
+            if session_uuid != user_id:
+                raise HTTPException(status_code=403, detail="Archivos no pertenecen al usuario")
+            path = BASE_DIR / session_uuid / inner_uuid / filename
+            if path.exists():
+                file_paths.append((str(path), filename))
+
+        if not file_paths:
+            raise HTTPException(status_code=400, detail="No se encontraron archivos válidos")
+
+        prompt = generate_system_prompt_from_files(file_paths, request.user_hint)
+        return {"system_prompt": prompt}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error generando prompt: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/assistants", status_code=status.HTTP_201_CREATED, dependencies=[Depends(verify_token_dependency)])
+async def create_assistant(request: AssistantCreateRequest, payload: dict = Depends(verify_token_dependency)):
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    repo = AssistantRepository()
+    try:
+        a = repo.create(AssistantCreate(user_id=user_id, name=request.name, description=request.description, system_prompt=request.system_prompt))
+        return AssistantResponse(id=str(a.id), user_id=a.user_id, name=a.name, description=a.description, system_prompt=a.system_prompt, created_at=a.created_at.isoformat(), updated_at=a.updated_at.isoformat())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/assistants", dependencies=[Depends(verify_token_dependency)])
+async def list_assistants(
+    page: int = 1,
+    limit: int = 10,
+    payload: dict = Depends(verify_token_dependency)
+):
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    
+    if page < 1:
+        page = 1
+    if limit < 1 or limit > 50:
+        limit = 10
+    
+    offset = (page - 1) * limit
+    repo = AssistantRepository()
+    
+    try:
+        assistants = repo.get_user_assistants(user_id, limit=limit, offset=offset)
+        total = repo.count_user_assistants(user_id)
+        total_pages = (total + limit - 1) // limit if total > 0 else 1
+        
+        return {
+            "items": [AssistantResponse(id=str(a.id), user_id=a.user_id, name=a.name, description=a.description, system_prompt=a.system_prompt, created_at=a.created_at.isoformat(), updated_at=a.updated_at.isoformat()) for a in assistants],
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "total_pages": total_pages,
+                "has_next": page < total_pages,
+                "has_prev": page > 1
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/assistants/{assistant_id}", dependencies=[Depends(verify_token_dependency)])
+async def get_assistant(assistant_id: str, payload: dict = Depends(verify_token_dependency)):
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    repo = AssistantRepository()
+    a = repo.get(assistant_id)
+    if not a or a.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Asistente no encontrado")
+    return AssistantResponse(id=str(a.id), user_id=a.user_id, name=a.name, description=a.description, system_prompt=a.system_prompt, created_at=a.created_at.isoformat(), updated_at=a.updated_at.isoformat())
+
+
+@app.put("/assistants/{assistant_id}", dependencies=[Depends(verify_token_dependency)])
+async def update_assistant(assistant_id: str, request: AssistantUpdateRequest, payload: dict = Depends(verify_token_dependency)):
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    repo = AssistantRepository()
+    a = repo.get(assistant_id)
+    if not a or a.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Asistente no encontrado")
+    a = repo.update(assistant_id, AssistantUpdate(name=request.name, description=request.description, system_prompt=request.system_prompt))
+    return AssistantResponse(id=str(a.id), user_id=a.user_id, name=a.name, description=a.description, system_prompt=a.system_prompt, created_at=a.created_at.isoformat(), updated_at=a.updated_at.isoformat())
+
+
+@app.delete("/assistants/{assistant_id}", dependencies=[Depends(verify_token_dependency)])
+async def delete_assistant(assistant_id: str, payload: dict = Depends(verify_token_dependency)):
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    repo = AssistantRepository()
+    a = repo.get(assistant_id)
+    if not a or a.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Asistente no encontrado")
+    repo.delete(assistant_id)
+    return {"message": "Asistente eliminado", "assistant_id": assistant_id}
 
 
 # ---------- Helpers ----------
@@ -1100,14 +1618,24 @@ async def get_thread_messages(
             )
 
         chat_repo = ChatThreadRepository()
-        
-        # Verificar que el thread pertenece al usuario
         messages = chat_repo.get_thread_messages(thread_id, limit=limit, ascending=True)
+
+        # Verificar que el thread pertenece al usuario
         if messages and messages[0].user_id != user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="No tienes permiso para acceder a este thread"
             )
+        # Para threads de asistente (assistant_xxx) sin mensajes, verificar que el asistente pertenece al usuario
+        if not messages and thread_id.startswith("assistant_"):
+            assistant_id = thread_id.replace("assistant_", "", 1)
+            assistant_repo = AssistantRepository()
+            assistant = assistant_repo.get(assistant_id)
+            if not assistant or assistant.user_id != user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="No tienes permiso para acceder a este asistente"
+                )
 
         # Formatear mensajes para el frontend
         formatted_messages = [
