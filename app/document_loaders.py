@@ -261,7 +261,7 @@ def load_img_documents(img_url: str, query: str = '', verbose=False):
         from langchain_google_genai import ChatGoogleGenerativeAI
         from langchain_core.messages import HumanMessage
         
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
+        llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview")
         
         # Codificar imagen en base64
         base64_image = encode_image(temp_path)
@@ -374,7 +374,7 @@ def load_mp3_documents(mp3_url: str, verbose=False):
         from langchain_google_genai import ChatGoogleGenerativeAI
         from langchain_core.messages import HumanMessage
         
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
+        llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview")
         
         # Crear mensaje con formato correcto para Gemini
         # Gemini acepta audio como bytes directamente o como base64

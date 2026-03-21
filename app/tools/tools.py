@@ -101,7 +101,7 @@ def search_scientific_resource(
         """
 
         model = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
+            model="gemini-3.1-flash-lite-preview",
             temperature=1
         )
 
@@ -137,7 +137,7 @@ def answer_question_from_file(
         print(f"Pregunta del usuario: {question}")
         
         model = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
+            model="gemini-3.1-flash-lite-preview",
             temperature=1
         )
 
@@ -722,6 +722,151 @@ def _search_google_basic(query: str, max_results: int) -> List[dict]:
     except Exception as e:
         print(f"Error en _search_google_basic: {e}")
         return []
+
+
+def generate_practice_questions(
+    topic: Annotated[str, "Tema o concepto sobre el cual generar preguntas de práctica"],
+    num_questions: Annotated[int, "Número de preguntas a generar (entre 1 y 10)"] = 5,
+    difficulty: Annotated[Literal["básico", "intermedio", "avanzado"], "Nivel de dificultad de las preguntas"] = "intermedio",
+    question_type: Annotated[Literal["opción múltiple", "verdadero/falso", "respuesta corta", "mixto"], "Tipo de preguntas a generar"] = "mixto"
+) -> str:
+    """
+    Genera preguntas de práctica para autoevaluación sobre un tema. Úsala cuando el usuario quiera practicar,
+    evaluarse, hacer un quiz, o reforzar su aprendizaje sobre un concepto específico.
+    """
+    try:
+        num_questions = max(1, min(10, num_questions))
+        model = ChatGoogleGenerativeAI(
+            model="gemini-3.1-flash-lite-preview",
+            temperature=0.8
+        )
+        prompt = f"""Eres un experto en diseño pedagógico. Genera {num_questions} preguntas de práctica sobre el tema: "{topic}".
+
+Requisitos:
+- Nivel de dificultad: {difficulty}
+- Tipo de preguntas: {question_type}
+- Si es "mixto", alterna entre opción múltiple, verdadero/falso y respuesta corta
+- Las preguntas deben ser claras, en español, y evaluar comprensión real (no memorización superficial)
+- Para opción múltiple: 4 opciones, una correcta
+- Incluye al final la respuesta correcta de cada pregunta en formato colapsado
+
+Formato de salida en Markdown:
+# Preguntas de práctica: {topic}
+[Para cada pregunta: número, enunciado, opciones si aplica, y respuesta correcta al final]
+
+Responde en español."""
+        response = model.invoke(prompt).content
+        return response
+    except Exception as e:
+        print(f"Error en generate_practice_questions: {e}")
+        return f"Error al generar preguntas: {str(e)}"
+
+
+def create_learning_plan(
+    topic: Annotated[str, "Tema o área de conocimiento para el plan de aprendizaje"],
+    duration_hint: Annotated[Optional[str], "Indicación de duración esperada (ej: 1 semana, 2 meses, intensivo)"] = None,
+    learning_style: Annotated[Optional[Literal["visual", "lectura", "práctica", "auditivo", "mixto"]], "Estilo de aprendizaje preferido"] = "mixto"
+) -> str:
+    """
+    Crea un plan de aprendizaje con objetivos, hitos y recursos sugeridos. Úsala cuando el usuario
+    pregunte "¿qué debo aprender sobre X?", "dame un plan de estudio", "por dónde empiezo con X",
+    o quiera estructura para aprender un tema profesionalmente.
+    """
+    try:
+        model = ChatGoogleGenerativeAI(
+            model="gemini-3.1-flash-lite-preview",
+            temperature=0.7
+        )
+        duration_text = f"Duración sugerida: {duration_hint}." if duration_hint else ""
+        style_text = f"Estilo de aprendizaje: {learning_style}." if learning_style else ""
+        prompt = f"""Crea un plan de aprendizaje profesional y estructurado para dominar el tema: "{topic}".
+
+{duration_text}
+{style_text}
+
+El plan debe incluir:
+1. **Objetivos de aprendizaje** (3-5 objetivos SMART claros)
+2. **Hitos/fases** con orden lógico y dependencias
+3. **Recursos sugeridos** (libros, cursos, documentación, papers si aplica)
+4. **Criterios de evaluación** para saber cuándo se dominó cada fase
+5. **Tiempo estimado** por fase
+
+Formato: Markdown claro, en español, con encabezados y listas. Sé práctico y orientado a aprendizaje profesional."""
+        response = model.invoke(prompt).content
+        return response
+    except Exception as e:
+        print(f"Error en create_learning_plan: {e}")
+        return f"Error al crear plan: {str(e)}"
+
+
+def create_study_notes(
+    topic: Annotated[str, "Tema central de las notas de estudio"],
+    context_summary: Annotated[Optional[str], "Resumen del contexto o puntos clave de la conversación previa sobre el tema"] = None,
+    format_style: Annotated[Literal["esquema", "bullet points", "tarjetas"], "Estilo de formato de las notas"] = "esquema"
+) -> str:
+    """
+    Genera notas de estudio reutilizables sobre un tema. Úsala cuando el usuario pida "resúmenes", 
+    "notas de estudio", "guía de repaso", "material para estudiar", o quiera consolidar lo discutido
+    en la conversación en formato de apuntes.
+    """
+    try:
+        model = ChatGoogleGenerativeAI(
+            model="gemini-3.1-flash-lite-preview",
+            temperature=0.6
+        )
+        context_text = f"\nContexto de la conversación previa:\n{context_summary}" if context_summary else ""
+        format_hint = {
+            "esquema": "jerárquico con encabezados y sub-items",
+            "bullet points": "lista de puntos concisos con viñetas",
+            "tarjetas": "formato pregunta-respuesta breve tipo flashcard"
+        }.get(format_style, "esquema")
+        prompt = f"""Genera notas de estudio profesionales sobre el tema: "{topic}".{context_text}
+
+Formato: {format_hint}
+- Incluye conceptos clave, definiciones, ejemplos cuando ayuden
+- Estructura clara para repaso posterior
+- En español, Markdown
+
+Las notas deben ser concisas pero completas, listas para estudiar o repasar."""
+        response = model.invoke(prompt).content
+        return response
+    except Exception as e:
+        print(f"Error en create_study_notes: {e}")
+        return f"Error al crear notas: {str(e)}"
+
+
+def explain_concept_scaffolded(
+    concept: Annotated[str, "Concepto a explicar"],
+    level: Annotated[Literal["principiante", "intermedio", "experto"], "Nivel de profundidad de la explicación"] = "intermedio",
+    use_analogy: Annotated[bool, "Usar analogías para facilitar comprensión"] = True
+) -> str:
+    """
+    Explica un concepto con andamiaje pedagógico adaptado al nivel. Úsala cuando el usuario
+    pida "explica como si fuera X", "no entiendo X", "¿qué es X en términos simples?",
+    o necesite una explicación a diferente nivel de profundidad.
+    """
+    try:
+        model = ChatGoogleGenerativeAI(
+            model="gemini-3.1-flash-lite-preview",
+            temperature=0.7
+        )
+        analogy_hint = "Incluye al menos una analogía o ejemplo cotidiano." if use_analogy else ""
+        prompt = f"""Explica el concepto "{concept}" en español.
+
+Requisitos:
+- Nivel: {level}
+  * Principiante: lenguaje simple, evita jerga, conceptos básicos primero
+  * Intermedio: balance entre rigor y accesibilidad
+  * Experto: precisión técnica, matices, conexiones con otros conceptos
+{analogy_hint}
+- Usa Markdown
+- Sé claro, estructurado y pedagógico
+- Si es relevante, incluye un ejemplo concreto"""
+        response = model.invoke(prompt).content
+        return response
+    except Exception as e:
+        print(f"Error en explain_concept_scaffolded: {e}")
+        return f"Error al explicar concepto: {str(e)}"
 
 
 def _format_web_search_results(query: str, results: List[dict]) -> str:

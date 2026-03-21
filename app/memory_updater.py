@@ -26,7 +26,7 @@ class MemoryUpdater:
         self.chat_repo = ChatThreadRepository()
         self.memory_repo = MemoryRepository()
         self.user_repo = UserRepository()
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=1)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=1)
 
     async def update_user_profile(self, user_id: str, thread_id: str, min_user_messages: int = 8) -> Dict[str, Any]:
         """

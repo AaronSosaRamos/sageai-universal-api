@@ -1,9 +1,17 @@
-import threading
-from app.tools.tools import answer_question_from_file, search_scientific_resource, search_academic_papers, web_search
+from app.tools.tools import (
+    answer_question_from_file,
+    search_scientific_resource,
+    search_academic_papers,
+    web_search,
+    generate_practice_questions,
+    create_learning_plan,
+    create_study_notes,
+    explain_concept_scaffolded,
+)
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
-from app.db.chat_management import ChatThreadRepository, ChatMessageCreate, ChatHistory
+from app.db.chat_management import ChatThreadRepository, ChatMessageCreate
 from app.memory_updater import MemoryUpdater
 from app.db.memory_management import MemoryRepository
 from app.db.custom_space_management import CustomSpaceRepository
@@ -33,13 +41,12 @@ def get_supervisor_response(
     print(f"Pregunta del usuario: {user_request_sanitized[:200]}...")
 
     model = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        temperature=1
+        model="gemini-3.1-flash-lite-preview",
+        temperature=0.75  # Más consistencia pedagógica; sigue siendo conversacional
     )
 
-    previous_context = ChatHistory(ChatThreadRepository()).get_history_string(thread_id)
-
-    print(f"Previous context: {previous_context}")
+    chat_repo = ChatThreadRepository()
+    history_messages = chat_repo.get_thread_messages(thread_id, limit=24, ascending=True)
 
     # Obtener información del usuario
     user_repo = UserRepository()
@@ -117,21 +124,6 @@ IMPORTANTE: Usa toda esta información para personalizar completamente tus respu
 {'='*80}
 """
 
-    # Construir el prompt con el contexto claramente integrado
-    context_section = ""
-    if previous_context and previous_context.strip():
-        context_section = f"""
-HISTORIAL DE CONVERSACIÓN ANTERIOR:
-{previous_context}
-
-IMPORTANTE: Tienes acceso completo al historial de conversación anterior. Debes usar esta información para responder preguntas sobre mensajes previos, mantener el contexto de la conversación, y referirte a información mencionada anteriormente cuando sea relevante.
-"""
-    else:
-        context_section = """
-NOTA: Esta es una nueva conversación sin historial previo.
-"""
-
-    print(f"Context section: {context_section}")
     if user_profile_section:
         print(f"User profile section included: {semantic_memory.user_name if semantic_memory else 'N/A'}")
 
@@ -141,19 +133,32 @@ NOTA: Esta es una nueva conversación sin historial previo.
             search_scientific_resource,
             answer_question_from_file,
             search_academic_papers,
-            web_search
+            web_search,
+            generate_practice_questions,
+            create_learning_plan,
+            create_study_notes,
+            explain_concept_scaffolded,
         ],
-        prompt=f"""Eres un asistente inteligente y útil que puede responder preguntas y ayudar con diversas tareas.
+        prompt=f"""Eres un tutor profesional de educación personalizada. Tu rol es guiar el aprendizaje de forma conversacional, empática y adaptada a cada persona.
+
+IDENTIDAD Y COMPORTAMIENTO:
+- Tutor experto que usa el método socrático: haz preguntas que ayuden a reflexionar antes de dar respuestas directas.
+- Andamiaje: adapta la profundidad al nivel del usuario (principiante, intermedio, experto).
+- Multi-turn conversacional: mantén coherencia con todo lo dicho antes; usa referencias ("como vimos...", "retomando tu pregunta sobre...").
+- No des respuestas triviales; profundiza cuando el tema lo amerite.
+- Sé cálido pero profesional.
 
 {user_profile_section}
 
-{context_section}
-
 HERRAMIENTAS DISPONIBLES:
-- search_scientific_resource: Busca información en recursos científicos cuando el usuario especifique el recurso científico.
-- answer_question_from_file: Responde preguntas sobre archivos cuando el usuario especifique el archivo.
-- search_academic_papers: Busca y extrae los últimos artículos académicos de fuentes profesionales como ArXiv, Scopus, ResearchGate, etc. Usa esta herramienta cuando el usuario solicite buscar artículos académicos, papers científicos, investigaciones recientes, o literatura académica.
-- web_search: Realiza búsquedas en la web para obtener información actualizada de internet, noticias, documentación técnica, o cualquier contenido disponible en la web. Usa esta herramienta cuando el usuario necesite información actualizada, noticias recientes, datos en tiempo real, o información que no está en los archivos proporcionados.
+- search_scientific_resource: Busca en recursos científicos cuando el usuario especifique archivos/URLs científicos.
+- answer_question_from_file: Responde preguntas sobre archivos cuando el usuario proporcione archivos (PDF, docx, etc.).
+- search_academic_papers: Busca artículos académicos en ArXiv, Scopus, ResearchGate cuando pidan papers, investigaciones o literatura científica.
+- web_search: Busca en la web para información actualizada, noticias, documentación técnica o datos en tiempo real.
+- generate_practice_questions: Genera preguntas de práctica/quiz cuando el usuario quiera practicar, evaluarse o reforzar un tema.
+- create_learning_plan: Crea planes de aprendizaje con objetivos y hitos cuando pidan "plan de estudio", "qué debo aprender", "por dónde empiezo".
+- create_study_notes: Genera notas de estudio cuando pidan resúmenes, apuntes, guía de repaso o consolidar lo discutido.
+- explain_concept_scaffolded: Explica conceptos a nivel principiante/intermedio/experto cuando pidan "explica como si...", "no entiendo X", "qué es X en términos simples".
 
 FORMATO DE ARCHIVOS (cuando el usuario los proporcione):
 Files:
@@ -163,54 +168,38 @@ Files:
 - http://example.com/files/path/sheet.xlsx (File Type: xlsx)
 - http://example.com/files/path/audio.mp3 (File Type: mp3)
 
-TIPOS DE ARCHIVOS SOPORTADOS:
-- pdf: Documentos PDF
-- docx: Documentos de Word
-- xlsx/xls: Hojas de cálculo Excel
-- img: Imágenes (jpg, png, etc.)
-- mp3: Archivos de audio
-- url: URL de Sitios Web
+TIPOS: pdf, docx, xlsx/xls, img, mp3, url.
 
-PREGUNTA ACTUAL DEL USUARIO:
-{full_user_message_for_llm}
+REGLAS:
+1. Mantén el contexto conversacional: usa el historial para responder preguntas sobre mensajes previos.
+2. Adapta tono y profundidad al perfil del usuario cuando exista información de personalización.
+3. Prioriza herramientas cuando sean claramente útiles; no abuses si la respuesta es sencilla.
+4. Responde siempre en español con Markdown cuando sea apropiado.
+5. Sé natural y conversacional.
 
-INSTRUCCIONES:
-1. SI la pregunta se refiere a mensajes anteriores (ej: "qué dije antes", "recuerdas cuando...", "mencionaste..."), DEBES consultar el HISTORIAL DE CONVERSACIÓN ANTERIOR arriba y responder basándote en esa información.
-2. Si hay información de PERSONALIZACIÓN DEL USUARIO disponible, úsala para adaptar tu respuesta a sus preferencias, intereses, métodos preferidos y estilo de trabajo. Personaliza el tono, nivel de detalle y enfoque según su perfil.
-3. Si la pregunta requiere información de archivos, usa la herramienta answer_question_from_file.
-4. Si la pregunta requiere búsqueda científica, usa search_scientific_resource.
-5. Si el usuario solicita buscar artículos académicos, papers científicos, investigaciones recientes, literatura académica, o menciona fuentes como ArXiv, Scopus, ResearchGate, usa la herramienta search_academic_papers.
-6. Si el usuario necesita información actualizada de internet, noticias recientes, datos en tiempo real, información que no está en los archivos proporcionados, o menciona "buscar en internet/web/google", usa la herramienta web_search.
-7. Responde siempre en español usando formato Markdown cuando sea apropiado.
-8. Sé natural, conversacional y útil, adaptándote al perfil del usuario cuando sea relevante.
-
-{get_defensive_supervisor_instructions()}
-
-RESPUESTA:"""
+{get_defensive_supervisor_instructions()}"""
     )
 
-    # Construir el mensaje completo con contexto
-    if previous_context and previous_context.strip():
-        full_user_message = f"""HISTORIAL DE CONVERSACIÓN ANTERIOR:
-{previous_context}
+    # Construir mensajes multi-turn: historial real + mensaje actual
+    messages = []
+    for m in history_messages:
+        if m.role == "Human":
+            messages.append(HumanMessage(content=m.message))
+        else:
+            messages.append(AIMessage(content=m.message))
+    messages.append(HumanMessage(content=full_user_message_for_llm))
 
-PREGUNTA ACTUAL:
-{full_user_message_for_llm}
-
-IMPORTANTE: Si la pregunta se refiere a mensajes anteriores, usa el historial de conversación anterior para responder."""
-    else:
-        full_user_message = full_user_message_for_llm
-
-    user_input = {
-        "messages": [
-            {
-                "role": "user",
-                "content": full_user_message
-            }
-        ]
-    }
+    user_input = {"messages": messages}
     response = supervisor.invoke(user_input)
-    ai_response = response["messages"][-1].content
+    # Extraer la última respuesta de texto del asistente (puede haber ToolMessages intermedios)
+    ai_response = ""
+    for msg in reversed(response["messages"]):
+        if isinstance(msg, AIMessage) and msg.content:
+            ai_response = msg.content if isinstance(msg.content, str) else str(msg.content)
+            break
+    if not ai_response and response["messages"]:
+        last = response["messages"][-1]
+        ai_response = getattr(last, "content", "") or ""
     ai_response = sanitize_ai_response(ai_response)
     print(ai_response)
 
@@ -288,7 +277,7 @@ def get_assistant_chat_response(
     history_messages = chat_repo.get_thread_messages(thread_id, limit=20, ascending=True)
 
     model = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+        model="gemini-3.1-flash-lite-preview",
         temperature=0.7
     )
 

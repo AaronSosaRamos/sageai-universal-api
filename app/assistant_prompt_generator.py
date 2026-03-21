@@ -75,7 +75,7 @@ def generate_system_prompt_from_files(
     
     combined = "\n\n---\n\n".join(all_content)[:15000]  # limit total
     
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7)
+    llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=0.7)
     
     prompt = f"""Analiza el siguiente contenido extraído de documentos e imágenes subidos por el usuario.
 Tu tarea es generar un SYSTEM PROMPT profesional para un asistente de IA personalizado.
