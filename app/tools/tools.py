@@ -25,6 +25,7 @@ def search_scientific_resource(
         "img",
         "mp3",
         "url",
+        "doc",
         "docx",
         "xls",
         "xlsx"
@@ -122,6 +123,7 @@ def answer_question_from_file(
         "img",
         "mp3",
         "url",
+        "doc",
         "docx",
         "xls",
         "xlsx"

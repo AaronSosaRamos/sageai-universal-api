@@ -101,6 +101,27 @@ class AssistantRepository:
         except APIError as e:
             raise RuntimeError(f"Error al contar asistentes: {e}") from e
 
+    def list_all_assistants(self, limit: int = 10, offset: int = 0) -> List[Assistant]:
+        """Todos los asistentes (catálogo global), más recientes primero."""
+        try:
+            res = (
+                self.client.table(self.table)
+                .select("*")
+                .order("updated_at", desc=True)
+                .range(offset, offset + limit - 1)
+                .execute()
+            )
+            return [self._to_assistant(r) for r in (res.data or [])]
+        except APIError as e:
+            raise RuntimeError(f"Error al listar asistentes: {e}") from e
+
+    def count_all_assistants(self) -> int:
+        try:
+            res = self.client.table(self.table).select("id", count="exact").execute()
+            return res.count or 0
+        except APIError as e:
+            raise RuntimeError(f"Error al contar asistentes: {e}") from e
+
     def update(self, assistant_id: uuid.UUID | str, data: AssistantUpdate) -> Assistant:
         payload: Dict[str, Any] = {}
         if data.name is not None:

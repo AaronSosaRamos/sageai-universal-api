@@ -1,22 +1,33 @@
-from fastapi import FastAPI, HTTPException, status, Depends, Body
+from fastapi import FastAPI, HTTPException, status, Depends, Body, Query
 from pydantic import BaseModel, EmailStr, constr
 from datetime import timedelta, datetime
-from typing import Dict, Optional
+from typing import Dict, Literal, Optional
 from .config import get_settings
 from .security import create_access_token
-from .auth import verify_token_dependency
+from .auth import verify_token_dependency, require_admin_dependency
 from .supervisor import get_supervisor_response, get_assistant_chat_response
 from .db.user_management import UserRepository, UserCreate
+from .user_import import build_user_import_template_xlsx, parse_user_import_xlsx
 from .db.thread_manager import ThreadManager, ThreadCreate
 from .db.chat_management import ChatThreadRepository
 from .db.custom_space_management import CustomSpaceRepository, CustomSpaceCreate, CustomSpaceUpdate
-from .db.assistant_management import AssistantRepository, AssistantCreate, AssistantUpdate
+from .db.assistant_management import AssistantRepository, AssistantCreate, AssistantUpdate, Assistant
+from .db.usage_limits import UsageLimitRepository
 from .assistant_prompt_generator import generate_system_prompt_from_files
+from .response_export import export_markdown
 from .security import verify_token
+from .db.analytics_management import (
+    AnalyticsRepository,
+    InteractionEventInsert,
+    safe_record_interaction_event,
+)
+from .analytics_helpers import client_snapshot_from_request, track_event
 
 # pip install fastapi uvicorn python-multipart
 import os
+import io
 import uuid
+import hashlib
 import shutil
 import asyncio
 import time
@@ -26,7 +37,7 @@ from typing import List, Any
 from unicodedata import normalize
 
 from fastapi import FastAPI, UploadFile, File, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 from collections import defaultdict, deque
 
@@ -34,6 +45,10 @@ app = FastAPI()
 
 BASE_DIR = Path("storage")
 BASE_DIR.mkdir(exist_ok=True)
+
+# Límites: usuarios tipo 'user' — interacciones/día en chat principal y assistant; archivos — todos los usuarios
+DAILY_INTERACTION_LIMIT_USER = int(os.getenv("DAILY_INTERACTION_LIMIT_USER", "50"))
+MAX_UPLOAD_FILE_BYTES = int(os.getenv("MAX_UPLOAD_FILE_BYTES", str(2 * 1024 * 1024)))
 
 # Diccionario de sesiones: { session_uuid: {"last": timestamp, "inner": inner_uuid} }
 sessions: dict[str, dict] = {}
@@ -385,6 +400,80 @@ class AssistantResponse(BaseModel):
     system_prompt: str
     created_at: str
     updated_at: str
+    source: Literal["mine", "catalog"] = "mine"
+    is_owner: bool = True
+
+
+def _can_use_assistant(a: Assistant, _viewer_id: str) -> bool:
+    """Cualquier usuario autenticado puede chatear con cualquier asistente; solo el dueño edita/borra."""
+    return a is not None
+
+
+def _assistant_to_response(
+    a: Assistant,
+    viewer_id: str,
+    *,
+    list_scope: Optional[Literal["mine", "catalog"]] = None,
+) -> AssistantResponse:
+    is_owner = a.user_id == viewer_id
+
+    if list_scope == "catalog":
+        source: Literal["mine", "catalog"] = "catalog"
+        system_prompt = a.system_prompt if is_owner else ""
+    elif list_scope == "mine":
+        source = "mine"
+        system_prompt = a.system_prompt
+    else:
+        source = "catalog" if not is_owner else "mine"
+        system_prompt = "" if not is_owner else a.system_prompt
+
+    return AssistantResponse(
+        id=str(a.id),
+        user_id=a.user_id,
+        name=a.name,
+        description=a.description,
+        system_prompt=system_prompt,
+        created_at=a.created_at.isoformat(),
+        updated_at=a.updated_at.isoformat(),
+        source=source,
+        is_owner=is_owner,
+    )
+
+
+def _token_user_type(payload: dict) -> str:
+    return (payload.get("user_type") or "user").strip().lower()
+
+
+def _is_restricted_user(payload: dict) -> bool:
+    """Plan 'user': límite diario de interacciones y no puede crear asistentes."""
+    return _token_user_type(payload) == "user"
+
+
+def _consume_interaction_if_limited(payload: dict) -> None:
+    if not _is_restricted_user(payload):
+        return
+    uid = payload.get("user_id")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    try:
+        repo = UsageLimitRepository()
+        allowed, _ = repo.consume_daily_interaction(
+            str(uid), datetime.utcnow().date(), DAILY_INTERACTION_LIMIT_USER
+        )
+    except Exception as e:
+        print(f"[UsageLimit] Error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo verificar el límite de uso. Intenta más tarde.",
+        )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"Has alcanzado el límite de {DAILY_INTERACTION_LIMIT_USER} interacciones por día. "
+                "Vuelve mañana (UTC)."
+            ),
+        )
 
 
 class GeneratePromptRequest(BaseModel):
@@ -395,6 +484,14 @@ class GeneratePromptRequest(BaseModel):
 class AssistantChatRequest(BaseModel):
     query: str
     assistant_id: str
+
+
+class ExportResponseRequest(BaseModel):
+    """Exporta contenido Markdown (respuesta del chat) a Word o PDF."""
+
+    content: str
+    format: Literal["docx", "pdf"]
+    title: Optional[str] = None
 
 
 @app.get("/")
@@ -416,49 +513,80 @@ async def health_check():
 
 
 @app.post("/token")
-async def generate_token(request: TokenRequest) -> Dict[str, str]:
+async def generate_token(http_request: Request, body: TokenRequest) -> Dict[str, str]:
     """
     Generates a JWT token if all validations pass:
     - secret_value must match the environment variable
     - email must exist in the database
     - password must be correct for that email
     """
+    t0 = time.perf_counter()
+    email_key = hashlib.sha256(body.email.strip().lower().encode("utf-8")).hexdigest()[:16]
+
+    def _auth_track(success: bool, status: int, user_id: Optional[str] = None, err: Optional[str] = None):
+        track_event(
+            event_category="auth",
+            event_name="auth.login.success" if success else "auth.login.failure",
+            user_id=user_id,
+            request=http_request,
+            http_method="POST",
+            http_path="/token",
+            status_code=status,
+            duration_ms=int((time.perf_counter() - t0) * 1000),
+            success=success,
+            error_message=err,
+            metadata={"email_key": email_key},
+        )
+
     try:
-        # 1. Validar secret_value
-        if request.secret_value != settings.secret_value:
+        if body.secret_value != settings.secret_value:
+            _auth_track(False, 401, err="invalid_secret")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid secret value"
             )
 
-        # 2. Validar credenciales del usuario
         user_repo = UserRepository()
-        user = user_repo.get_user_by_email(request.email)
-        
-        if not user or not user_repo.verify_password(request.password, user.password):
+        user = user_repo.get_user_by_email(body.email)
+
+        if not user or not user_repo.verify_password(body.password, user.password):
+            _auth_track(False, 401, err="invalid_credentials")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid credentials"
             )
 
-        # 3. Generar token con datos del usuario y secret_value
         access_token = create_access_token(
             data={
                 "secret_value": settings.secret_value,
                 "user_id": str(user.id),
                 "email": user.email,
                 "nombre": user.nombre,
-                "apellido": user.apellido
+                "apellido": user.apellido,
+                "user_type": getattr(user, "user_type", None) or "user",
             },
             expires_delta=timedelta(minutes=settings.access_token_expire_minutes)
         )
-        
+
+        _auth_track(True, 200, user_id=str(user.id))
         return {"access_token": access_token}
-        
+
     except HTTPException:
         raise
     except Exception as e:
         print(f"Error generating token: {str(e)}")
+        track_event(
+            event_category="auth",
+            event_name="auth.login.failure",
+            request=http_request,
+            http_method="POST",
+            http_path="/token",
+            status_code=500,
+            duration_ms=int((time.perf_counter() - t0) * 1000),
+            success=False,
+            error_message=str(e)[:500],
+            metadata={"email_key": email_key},
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error generating token"
@@ -474,96 +602,198 @@ async def test_auth():
 
 
 @app.post("/security-code")
-async def generate_security_code(request: SecurityCodeRequest) -> SecurityCodeResponse:
-    """
-    Genera un código de seguridad temporal para el registro de usuarios.
-    El código expira después de 15 minutos.
-    Requiere el secret_value correcto para generar el código.
-    """
-    try:
-        # Validar secret_value
-        if request.secret_value != settings.secret_value:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Secret value inválido"
-            )
+async def generate_security_code(http_request: Request, _request: SecurityCodeRequest):
+    """Deshabilitado: el registro ya no usa códigos generados con clave secreta."""
+    track_event(
+        event_category="security",
+        event_name="security.code_generation.blocked",
+        request=http_request,
+        http_method="POST",
+        http_path="/security-code",
+        status_code=403,
+        success=False,
+        metadata={"reason": "disabled"},
+    )
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="La generación de códigos con clave secreta está deshabilitada.",
+    )
 
-        # Generar código aleatorio de 6 caracteres alfanuméricos
-        code = ''.join(uuid.uuid4().hex[:6].upper())
-        now = datetime.utcnow()
-        expires_at = now + timedelta(minutes=15)
-        
-        # Almacenar el código con su tiempo de expiración
-        security_codes[code] = {
-            "created_at": now,
-            "expires_at": expires_at
-        }
-        
-        return SecurityCodeResponse(
-            code=code,
-            expires_in=900  # 15 minutos en segundos
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error generando security code: {str(e)}")
+
+@app.post("/users", status_code=status.HTTP_403_FORBIDDEN)
+async def create_user_public_disabled(http_request: Request, _request: UserRegistrationRequest):
+    """El registro público está cerrado; los usuarios se crean por importación administrativa (.xlsx)."""
+    track_event(
+        event_category="security",
+        event_name="auth.register.blocked",
+        request=http_request,
+        http_method="POST",
+        http_path="/users",
+        status_code=403,
+        success=False,
+        metadata={"reason": "public_registration_disabled"},
+    )
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="El registro público está deshabilitado. Los usuarios se crean mediante importación administrativa.",
+    )
+
+
+@app.get("/admin/users/import-template")
+async def download_user_import_template(
+    http_request: Request,
+    admin_payload: dict = Depends(require_admin_dependency),
+) -> Response:
+    """Descarga plantilla Excel para alta masiva de usuarios (solo administradores)."""
+    track_event(
+        event_category="api",
+        event_name="admin.users.template_downloaded",
+        user_id=admin_payload.get("user_id"),
+        request=http_request,
+        http_method="GET",
+        http_path="/admin/users/import-template",
+        status_code=200,
+        success=True,
+    )
+    data = build_user_import_template_xlsx()
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": 'attachment; filename="plantilla_usuarios.xlsx"',
+        },
+    )
+
+
+@app.post("/admin/users/bulk-import")
+async def bulk_import_users(
+    http_request: Request,
+    file: UploadFile = File(...),
+    admin_payload: dict = Depends(require_admin_dependency),
+) -> Dict[str, Any]:
+    """
+    Importa usuarios desde un .xlsx según la plantilla (solo administradores).
+    """
+    if not file.filename or not file.filename.lower().endswith(".xlsx"):
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error generando código de seguridad"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Solo se admiten archivos .xlsx",
         )
-
-@app.post("/users", status_code=status.HTTP_201_CREATED)
-async def create_user(request: UserRegistrationRequest) -> Dict[str, str]:
-    """
-    Crea un nuevo usuario.
-    
-    Args:
-        request: Datos del usuario a crear
-        
-    Returns:
-        Dict con mensaje de éxito e ID del usuario
-        
-    Raises:
-        HTTPException: Si el email ya está registrado o hay otros errores
-    """
-    try:
-        # Crear repositorio
-        user_repo = UserRepository()
-        
-        # Verificar si el email ya existe
-        existing_user = user_repo.get_user_by_email(request.email)
-        if existing_user:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="El email ya está registrado"
-            )
-        
-        # Crear el usuario
-        user = user_repo.create_user(UserCreate(
-            nombre=request.nombre,
-            apellido=request.apellido,
-            email=request.email,
-            password=request.password
-        ))
-        
+    content = await file.read()
+    rows, parse_errors = parse_user_import_xlsx(content)
+    if not rows and parse_errors:
         return {
-            "message": "Usuario creado exitosamente",
-            "user_id": str(user.id)
+            "created": [],
+            "failed": parse_errors,
+            "total_created": 0,
+            "total_failed": len(parse_errors),
+            "message": "No se importó ningún usuario",
         }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error al crear usuario: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error al crear el usuario"
+
+    user_repo = UserRepository()
+    created: List[Dict[str, str]] = []
+    failed: List[Dict[str, Any]] = list(parse_errors)
+    seen_email: set[str] = set()
+
+    for pr in rows:
+        if pr.email in seen_email:
+            failed.append(
+                {"row": pr.row_num, "email": pr.email, "error": "Email duplicado en el archivo"}
+            )
+            continue
+        seen_email.add(pr.email)
+        try:
+            if user_repo.get_user_by_email(pr.email):
+                failed.append(
+                    {"row": pr.row_num, "email": pr.email, "error": "El email ya está registrado"}
+                )
+                continue
+            user = user_repo.create_user(
+                UserCreate(
+                    nombre=pr.nombre,
+                    apellido=pr.apellido,
+                    email=pr.email,
+                    password=pr.password,
+                    user_type=pr.user_type,
+                )
+            )
+            created.append({"user_id": str(user.id), "email": user.email})
+            safe_record_interaction_event(
+                InteractionEventInsert(
+                    event_category="user",
+                    event_name="user.registered",
+                    user_id=str(user.id),
+                    success=True,
+                    metadata={"source": "admin.bulk_import", "row": pr.row_num},
+                )
+            )
+        except Exception as e:
+            failed.append({"row": pr.row_num, "email": pr.email, "error": str(e)})
+
+    track_event(
+        event_category="api",
+        event_name="admin.users.bulk_import.completed",
+        user_id=admin_payload.get("user_id"),
+        request=http_request,
+        http_method="POST",
+        http_path="/admin/users/bulk-import",
+        status_code=200,
+        success=True,
+        metadata={"filename": file.filename},
+        metrics={
+            "created_count": len(created),
+            "failed_count": len(failed),
+            "parse_errors": len(parse_errors),
+        },
+    )
+
+    return {
+        "created": created,
+        "failed": failed,
+        "total_created": len(created),
+        "total_failed": len(failed),
+    }
+
+
+@app.get("/admin/analytics/dashboard")
+async def admin_analytics_dashboard(
+    days: int = Query(30, ge=1, le=365),
+    admin_payload: dict = Depends(require_admin_dependency),
+) -> Dict[str, Any]:
+    """
+    Resumen de métricas: eventos, categorías, serie diaria, LLM, auth y actividad reciente.
+    """
+    repo = AnalyticsRepository()
+    dash = repo.get_admin_dashboard(days=days)
+    try:
+        ur = UserRepository()
+        n_reg = ur.count_users()
+        dash["totals"]["users"] = n_reg
+        dash["adoption_reach"]["new_user_accounts_in_period"] = ur.count_users_created_since(
+            dash["period_start"]
         )
+        uq = dash["adoption_reach"].get("unique_active_users_in_sample") or 0
+        if n_reg and isinstance(uq, int):
+            dash["adoption_reach"]["ratio_sample_active_users_to_registered_total"] = round(
+                min(uq, n_reg) / n_reg, 4
+            )
+    except Exception:
+        dash["totals"]["users"] = None
+        dash["adoption_reach"]["new_user_accounts_in_period"] = None
+    try:
+        dash["totals"]["assistants"] = AssistantRepository().count_all_assistants()
+    except Exception:
+        dash["totals"]["assistants"] = None
+    dash["generated_for_user_id"] = admin_payload.get("user_id")
+    return dash
 
 
 @app.post("/supervisor", dependencies=[Depends(verify_token_dependency)])
-async def supervisor_endpoint(request: SupervisorRequest) -> Dict[str, str]:
+async def supervisor_endpoint(
+    http_request: Request,
+    supervisor_request: SupervisorRequest,
+    token_data: dict = Depends(verify_token_dependency),
+) -> Dict[str, str]:
     """
     Endpoint that calls the supervisor with the provided query in the request body.
     Requires:
@@ -571,46 +801,118 @@ async def supervisor_endpoint(request: SupervisorRequest) -> Dict[str, str]:
     - user_id: The session UUID that identifies the user
     - thread_id: The inner UUID that identifies the chat thread
     """
+    t0 = time.perf_counter()
+    uid = supervisor_request.user_id
+    tid = supervisor_request.thread_id
+    client = client_snapshot_from_request(http_request)
     try:
-        if not request.query.strip():
+        token_uid = token_data.get("user_id")
+        if not token_uid or token_uid != supervisor_request.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="El token no coincide con el usuario de la solicitud",
+            )
+
+        if not supervisor_request.query.strip():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="La consulta no puede estar vacía"
             )
 
-        if not request.user_id or not request.thread_id:
+        if not supervisor_request.user_id or not supervisor_request.thread_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Se requieren user_id y thread_id"
             )
 
-        # Verificar que el thread pertenece al usuario correcto
-        session_path = Path("storage") / request.user_id / request.thread_id
+        session_path = Path("storage") / supervisor_request.user_id / supervisor_request.thread_id
         if not session_path.exists():
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Sesión no encontrada o expirada"
             )
 
-        # Ejecutar get_supervisor_response en un thread separado para no bloquear
+        _consume_interaction_if_limited(token_data)
+
+        q = supervisor_request.query or ""
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
-            None, 
-            get_supervisor_response, 
-            request.query,
-            request.user_id,
-            request.thread_id
+            None,
+            get_supervisor_response,
+            supervisor_request.query,
+            supervisor_request.user_id,
+            supervisor_request.thread_id,
+        )
+
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        safe_record_interaction_event(
+            InteractionEventInsert(
+                event_category="supervisor",
+                event_name="api.supervisor.invoke",
+                user_id=uid,
+                thread_id=tid,
+                http_method="POST",
+                http_path="/supervisor",
+                status_code=200,
+                duration_ms=duration_ms,
+                success=True,
+                metrics={
+                    "response_chars": len(response or ""),
+                    "query_chars": len(q),
+                    "query_has_file_refs": ("Files:" in q or "/files/" in q),
+                },
+                metadata={"user_type": (token_data.get("user_type") or "user")},
+                client=client,
+            )
         )
 
         return {
             "response": response,
-            "user_id": request.user_id,
-            "thread_id": request.thread_id
+            "user_id": supervisor_request.user_id,
+            "thread_id": supervisor_request.thread_id,
         }
 
-    except HTTPException:
+    except HTTPException as he:
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        meta = {"reason_code": he.status_code}
+        if he.status_code == 429:
+            meta["usage_limit"] = "daily_interactions"
+        safe_record_interaction_event(
+            InteractionEventInsert(
+                event_category="supervisor",
+                event_name="api.supervisor.invoke",
+                user_id=uid,
+                thread_id=tid,
+                http_method="POST",
+                http_path="/supervisor",
+                status_code=he.status_code,
+                duration_ms=duration_ms,
+                success=False,
+                error_type="HTTPException",
+                error_message=str(he.detail)[:2000] if he.detail else None,
+                metadata=meta,
+                client=client,
+            )
+        )
         raise
     except Exception as e:
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        safe_record_interaction_event(
+            InteractionEventInsert(
+                event_category="supervisor",
+                event_name="api.supervisor.invoke",
+                user_id=uid,
+                thread_id=tid,
+                http_method="POST",
+                http_path="/supervisor",
+                status_code=500,
+                duration_ms=duration_ms,
+                success=False,
+                error_type=type(e).__name__,
+                error_message=str(e)[:2000],
+                client=client,
+            )
+        )
         print(f"Error en supervisor_endpoint: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -620,8 +922,9 @@ async def supervisor_endpoint(request: SupervisorRequest) -> Dict[str, str]:
 
 @app.post("/assistant-chat", dependencies=[Depends(verify_token_dependency)])
 async def assistant_chat_endpoint(
-    request: AssistantChatRequest,
-    payload: dict = Depends(verify_token_dependency)
+    http_request: Request,
+    chat_request: AssistantChatRequest,
+    payload: dict = Depends(verify_token_dependency),
 ) -> Dict[str, str]:
     """
     Chat con un asistente personalizado. Usa el system prompt del asistente,
@@ -631,31 +934,165 @@ async def assistant_chat_endpoint(
     if not user_id:
         raise HTTPException(status_code=401, detail="Token inválido")
 
+    client = client_snapshot_from_request(http_request)
     assistant_repo = AssistantRepository()
-    assistant = assistant_repo.get(request.assistant_id)
-    if not assistant or assistant.user_id != user_id:
+    assistant = assistant_repo.get(chat_request.assistant_id)
+    if not assistant or not _can_use_assistant(assistant, user_id):
         raise HTTPException(status_code=404, detail="Asistente no encontrado")
 
-    if not request.query.strip():
+    if not chat_request.query.strip():
         raise HTTPException(status_code=400, detail="La consulta no puede estar vacía")
 
+    _consume_interaction_if_limited(payload)
+
+    t0 = time.perf_counter()
+    aid = str(chat_request.assistant_id)
     try:
         loop = asyncio.get_event_loop()
+        cq = chat_request.query or ""
         response = await loop.run_in_executor(
             None,
             get_assistant_chat_response,
-            request.query,
+            chat_request.query,
             user_id,
-            str(request.assistant_id),
-            assistant.system_prompt or ""
+            str(chat_request.assistant_id),
+            assistant.system_prompt or "",
+        )
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        safe_record_interaction_event(
+            InteractionEventInsert(
+                event_category="assistant",
+                event_name="api.assistant_chat.invoke",
+                user_id=user_id,
+                assistant_id=aid,
+                thread_id=f"assistant_{aid}",
+                http_method="POST",
+                http_path="/assistant-chat",
+                status_code=200,
+                duration_ms=duration_ms,
+                success=True,
+                metrics={
+                    "response_chars": len(response or ""),
+                    "query_chars": len(cq),
+                    "query_has_file_refs": ("Files:" in cq or "/files/" in cq),
+                },
+                metadata={
+                    "assistant_owner_id": assistant.user_id,
+                    "user_type": (payload.get("user_type") or "user"),
+                },
+                client=client,
+            )
         )
         return {"response": response}
+    except HTTPException as he:
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        meta = {}
+        if he.status_code == 429:
+            meta["usage_limit"] = "daily_interactions"
+        safe_record_interaction_event(
+            InteractionEventInsert(
+                event_category="assistant",
+                event_name="api.assistant_chat.invoke",
+                user_id=user_id,
+                assistant_id=aid,
+                thread_id=f"assistant_{aid}",
+                http_method="POST",
+                http_path="/assistant-chat",
+                status_code=he.status_code,
+                duration_ms=duration_ms,
+                success=False,
+                error_type="HTTPException",
+                error_message=str(he.detail)[:2000] if he.detail else None,
+                metadata=meta,
+                client=client,
+            )
+        )
+        raise
     except Exception as e:
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        safe_record_interaction_event(
+            InteractionEventInsert(
+                event_category="assistant",
+                event_name="api.assistant_chat.invoke",
+                user_id=user_id,
+                assistant_id=aid,
+                thread_id=f"assistant_{aid}",
+                http_method="POST",
+                http_path="/assistant-chat",
+                status_code=500,
+                duration_ms=duration_ms,
+                success=False,
+                error_type=type(e).__name__,
+                error_message=str(e)[:2000],
+                client=client,
+            )
+        )
         print(f"Error en assistant_chat_endpoint: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
+
+
+@app.post("/export/response", dependencies=[Depends(verify_token_dependency)])
+async def export_response_endpoint(
+    http_request: Request,
+    export_body: ExportResponseRequest,
+    payload: dict = Depends(verify_token_dependency),
+):
+    """
+    Genera un archivo Word (.docx) o PDF a partir del texto del mensaje (Markdown).
+    Requiere token. El contenido se trunca si supera el límite interno de seguridad.
+    """
+    if not payload.get("user_id"):
+        raise HTTPException(status_code=401, detail="Token inválido")
+    if not export_body.content or not export_body.content.strip():
+        raise HTTPException(status_code=400, detail="El contenido no puede estar vacío")
+    uid = payload.get("user_id")
+    t0 = time.perf_counter()
+    try:
+        data, media_type, filename = export_markdown(
+            export_body.content.strip(),
+            export_body.format,
+            export_body.title,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        print(f"Error export_response: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error al generar el archivo",
+        ) from e
+
+    duration_ms = int((time.perf_counter() - t0) * 1000)
+    safe_record_interaction_event(
+        InteractionEventInsert(
+            event_category="export",
+            event_name="export.response",
+            user_id=uid,
+            http_method="POST",
+            http_path="/export/response",
+            status_code=200,
+            duration_ms=duration_ms,
+            success=True,
+            metadata={"format": export_body.format},
+            metrics={
+                "output_bytes": len(data),
+                "content_chars": len(export_body.content.strip()),
+            },
+            client=client_snapshot_from_request(http_request),
+        )
+    )
+
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 # ---------- Custom Space Endpoints ----------
@@ -937,7 +1374,11 @@ async def generate_assistant_prompt(
         user_id = payload.get("user_id")
         if not user_id:
             raise HTTPException(status_code=401, detail="Token inválido")
-
+        if _is_restricted_user(payload):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Tu tipo de cuenta no permite generar asistentes personalizados",
+            )
 
         file_paths = []
         for ref in request.file_refs:
@@ -968,10 +1409,15 @@ async def create_assistant(request: AssistantCreateRequest, payload: dict = Depe
     user_id = payload.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Token inválido")
+    if _is_restricted_user(payload):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tu tipo de cuenta no permite crear asistentes personalizados",
+        )
     repo = AssistantRepository()
     try:
         a = repo.create(AssistantCreate(user_id=user_id, name=request.name, description=request.description, system_prompt=request.system_prompt))
-        return AssistantResponse(id=str(a.id), user_id=a.user_id, name=a.name, description=a.description, system_prompt=a.system_prompt, created_at=a.created_at.isoformat(), updated_at=a.updated_at.isoformat())
+        return _assistant_to_response(a, user_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -980,35 +1426,45 @@ async def create_assistant(request: AssistantCreateRequest, payload: dict = Depe
 async def list_assistants(
     page: int = 1,
     limit: int = 10,
-    payload: dict = Depends(verify_token_dependency)
+    scope: str = Query("mine", description="'mine' = tus asistentes; 'catalog' = todos los asistentes"),
+    payload: dict = Depends(verify_token_dependency),
 ):
     user_id = payload.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Token inválido")
-    
+
+    scope_norm = (scope or "mine").strip().lower()
+    if scope_norm not in ("mine", "catalog"):
+        raise HTTPException(status_code=400, detail="scope debe ser mine o catalog")
+
     if page < 1:
         page = 1
     if limit < 1 or limit > 50:
         limit = 10
-    
+
     offset = (page - 1) * limit
     repo = AssistantRepository()
-    
+
     try:
-        assistants = repo.get_user_assistants(user_id, limit=limit, offset=offset)
-        total = repo.count_user_assistants(user_id)
+        if scope_norm == "catalog":
+            assistants = repo.list_all_assistants(limit=limit, offset=offset)
+            total = repo.count_all_assistants()
+        else:
+            assistants = repo.get_user_assistants(user_id, limit=limit, offset=offset)
+            total = repo.count_user_assistants(user_id)
         total_pages = (total + limit - 1) // limit if total > 0 else 1
-        
+
+        list_scope: Literal["mine", "catalog"] = "catalog" if scope_norm == "catalog" else "mine"
         return {
-            "items": [AssistantResponse(id=str(a.id), user_id=a.user_id, name=a.name, description=a.description, system_prompt=a.system_prompt, created_at=a.created_at.isoformat(), updated_at=a.updated_at.isoformat()) for a in assistants],
+            "items": [_assistant_to_response(a, user_id, list_scope=list_scope) for a in assistants],
             "pagination": {
                 "page": page,
                 "limit": limit,
                 "total": total,
                 "total_pages": total_pages,
                 "has_next": page < total_pages,
-                "has_prev": page > 1
-            }
+                "has_prev": page > 1,
+            },
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1021,9 +1477,9 @@ async def get_assistant(assistant_id: str, payload: dict = Depends(verify_token_
         raise HTTPException(status_code=401, detail="Token inválido")
     repo = AssistantRepository()
     a = repo.get(assistant_id)
-    if not a or a.user_id != user_id:
+    if not a or not _can_use_assistant(a, user_id):
         raise HTTPException(status_code=404, detail="Asistente no encontrado")
-    return AssistantResponse(id=str(a.id), user_id=a.user_id, name=a.name, description=a.description, system_prompt=a.system_prompt, created_at=a.created_at.isoformat(), updated_at=a.updated_at.isoformat())
+    return _assistant_to_response(a, user_id)
 
 
 @app.put("/assistants/{assistant_id}", dependencies=[Depends(verify_token_dependency)])
@@ -1036,7 +1492,7 @@ async def update_assistant(assistant_id: str, request: AssistantUpdateRequest, p
     if not a or a.user_id != user_id:
         raise HTTPException(status_code=404, detail="Asistente no encontrado")
     a = repo.update(assistant_id, AssistantUpdate(name=request.name, description=request.description, system_prompt=request.system_prompt))
-    return AssistantResponse(id=str(a.id), user_id=a.user_id, name=a.name, description=a.description, system_prompt=a.system_prompt, created_at=a.created_at.isoformat(), updated_at=a.updated_at.isoformat())
+    return _assistant_to_response(a, user_id)
 
 
 @app.delete("/assistants/{assistant_id}", dependencies=[Depends(verify_token_dependency)])
@@ -1219,7 +1675,10 @@ async def startup_event():
 
 
 @app.post("/start-session", dependencies=[Depends(verify_token_dependency)])
-async def start_session(token_data: dict = Depends(verify_token_dependency)):
+async def start_session(
+    http_request: Request,
+    token_data: dict = Depends(verify_token_dependency),
+):
     """
     Crea una nueva sesión de chat para el usuario autenticado.
     El user_id se obtiene del token JWT y se usa como session_uuid.
@@ -1251,6 +1710,19 @@ async def start_session(token_data: dict = Depends(verify_token_dependency)):
             sessions[user_id] = {}
         sessions[user_id] = {"last": time.time(), "inner": inner_uuid}
 
+        track_event(
+            event_category="api",
+            event_name="session.started",
+            user_id=user_id,
+            request=http_request,
+            thread_id=inner_uuid,
+            http_method="POST",
+            http_path="/start-session",
+            status_code=200,
+            success=True,
+            metadata={"storage_path_set": bool(path)},
+        )
+
         return {
             "session_uuid": user_id,  # Ahora es el user_id
             "inner_uuid": inner_uuid
@@ -1268,10 +1740,11 @@ async def start_session(token_data: dict = Depends(verify_token_dependency)):
 
 @app.post("/files/{session_uuid}/{inner_uuid}", dependencies=[Depends(verify_token_dependency)])
 async def upload_files(
-    session_uuid: str, 
-    inner_uuid: str, 
+    http_request: Request,
+    session_uuid: str,
+    inner_uuid: str,
     files: List[UploadFile] = File(...),
-    token_data: dict = Depends(verify_token_dependency)
+    token_data: dict = Depends(verify_token_dependency),
 ):
     """Sube archivos a la carpeta de la sesión"""
     # Verificar que el user_id del token coincide con session_uuid
@@ -1304,9 +1777,14 @@ async def upload_files(
         folder.mkdir(parents=True, exist_ok=True)
 
     urls = []
+    total_bytes = 0
+    extensions: List[str] = []
     for file in files:
         # Sanitizar el nombre del archivo
         safe_filename = sanitize_filename(file.filename)
+        _base, ext = os.path.splitext(safe_filename or "")
+        if ext:
+            extensions.append(ext.lower())
         file_path = folder / safe_filename
         
         # Si el archivo ya existe, agregar un sufijo único
@@ -1314,21 +1792,53 @@ async def upload_files(
             base, ext = os.path.splitext(safe_filename)
             safe_filename = f"{base}_{str(uuid.uuid4())[:8]}{ext}"
             file_path = folder / safe_filename
-            
+
+        raw = await file.read()
+        if len(raw) > MAX_UPLOAD_FILE_BYTES:
+            return JSONResponse(
+                {
+                    "error": "archivo demasiado grande",
+                    "detail": f"Cada archivo debe ser de {MAX_UPLOAD_FILE_BYTES // (1024 * 1024)} MB como máximo",
+                    "max_bytes": MAX_UPLOAD_FILE_BYTES,
+                },
+                status_code=413,
+            )
+        total_bytes += len(raw)
         with open(file_path, "wb") as f:
-            f.write(await file.read())
+            f.write(raw)
         urls.append(f"/files/{session_uuid}/{inner_uuid}/{safe_filename}")
 
     meta["last"] = time.time()
+
+    safe_record_interaction_event(
+        InteractionEventInsert(
+            event_category="storage",
+            event_name="file.uploaded",
+            user_id=user_id,
+            thread_id=inner_uuid,
+            http_method="POST",
+            http_path=f"/files/{session_uuid}/{inner_uuid}",
+            status_code=200,
+            success=True,
+            metadata={
+                "file_count": len(urls),
+                "extensions": list(dict.fromkeys(extensions))[:20],
+            },
+            metrics={"total_bytes": total_bytes, "files_count": len(urls)},
+            client=client_snapshot_from_request(http_request),
+        )
+    )
+
     return {"uploaded": urls}
 
 
 @app.get("/files/{session_uuid}/{inner_uuid}/{filename}", dependencies=[Depends(verify_token_dependency)])
 async def download_file(
-    session_uuid: str, 
-    inner_uuid: str, 
+    http_request: Request,
+    session_uuid: str,
+    inner_uuid: str,
     filename: str,
-    token_data: dict = Depends(verify_token_dependency)
+    token_data: dict = Depends(verify_token_dependency),
 ):
     """Descargar archivo desde la sesión"""
     # Verificar que el user_id del token coincide con session_uuid
@@ -1366,15 +1876,35 @@ async def download_file(
         file_path = original_path
 
     meta["last"] = time.time()
+    try:
+        sz = file_path.stat().st_size
+    except Exception:
+        sz = None
+    safe_record_interaction_event(
+        InteractionEventInsert(
+            event_category="storage",
+            event_name="file.downloaded",
+            user_id=user_id,
+            thread_id=inner_uuid,
+            http_method="GET",
+            http_path=f"/files/{session_uuid}/{inner_uuid}/[file]",
+            status_code=200,
+            success=True,
+            metadata={"filename_suffix": os.path.splitext(filename)[1].lower()},
+            metrics={"file_bytes": sz} if sz is not None else {},
+            client=client_snapshot_from_request(http_request),
+        )
+    )
     return FileResponse(file_path, filename=filename)
 
 
 @app.delete("/files/{session_uuid}/{inner_uuid}/{filename}", dependencies=[Depends(verify_token_dependency)])
 async def delete_file(
-    session_uuid: str, 
-    inner_uuid: str, 
+    http_request: Request,
+    session_uuid: str,
+    inner_uuid: str,
     filename: str,
-    token_data: dict = Depends(verify_token_dependency)
+    token_data: dict = Depends(verify_token_dependency),
 ):
     """Eliminar archivo de la sesión"""
     # Verificar que el user_id del token coincide con session_uuid
@@ -1414,6 +1944,18 @@ async def delete_file(
     try:
         os.remove(file_path)
         meta["last"] = time.time()
+        track_event(
+            event_category="storage",
+            event_name="file.deleted",
+            user_id=user_id,
+            request=http_request,
+            thread_id=inner_uuid,
+            http_method="DELETE",
+            http_path=f"/files/{session_uuid}/{inner_uuid}/…",
+            status_code=200,
+            success=True,
+            metadata={"filename_suffix": os.path.splitext(filename)[1].lower()},
+        )
         return {"message": f"File {filename} deleted successfully"}
     except Exception as e:
         return JSONResponse(
@@ -1424,9 +1966,10 @@ async def delete_file(
 
 @app.get("/threads", dependencies=[Depends(verify_token_dependency)], response_model=ThreadListResponse)
 async def list_threads(
+    http_request: Request,
     limit: int = 100,
     offset: int = 0,
-    token_data: dict = Depends(verify_token_dependency)
+    token_data: dict = Depends(verify_token_dependency),
 ):
     """
     Lista todos los threads del usuario autenticado con paginación.
@@ -1450,7 +1993,19 @@ async def list_threads(
         thread_manager = ThreadManager(storage_base_dir=BASE_DIR)
         threads = thread_manager.list_user_threads(user_id, limit=limit, offset=offset)
         total = thread_manager.get_user_thread_count(user_id)
-        
+
+        track_event(
+            event_category="thread",
+            event_name="api.threads.list",
+            user_id=user_id,
+            request=http_request,
+            http_method="GET",
+            http_path="/threads",
+            status_code=200,
+            success=True,
+            metrics={"returned_count": len(threads), "total": total, "limit": limit, "offset": offset},
+        )
+
         return ThreadListResponse(
             threads=threads,
             total=total,
@@ -1474,8 +2029,9 @@ async def list_threads(
 
 @app.post("/threads", dependencies=[Depends(verify_token_dependency)], status_code=status.HTTP_201_CREATED, response_model=ThreadResponse)
 async def create_thread(
-    request: Optional[ThreadCreateRequest] = Body(default=None),
-    token_data: dict = Depends(verify_token_dependency)
+    http_request: Request,
+    body: Optional[ThreadCreateRequest] = Body(default=None),
+    token_data: dict = Depends(verify_token_dependency),
 ):
     """
     Crea un nuevo thread de chat para el usuario autenticado.
@@ -1501,7 +2057,7 @@ async def create_thread(
         thread_data = thread_manager.create_thread(
             ThreadCreate(
                 user_id=user_id,
-                thread_id=request.thread_id if request else None
+                thread_id=body.thread_id if body else None
             ),
             create_storage_dir=True
         )
@@ -1510,6 +2066,19 @@ async def create_thread(
         if user_id not in sessions:
             sessions[user_id] = {}
         sessions[user_id] = {"last": time.time(), "inner": thread_data["thread_id"]}
+
+        track_event(
+            event_category="thread",
+            event_name="api.threads.create",
+            user_id=user_id,
+            request=http_request,
+            thread_id=thread_data["thread_id"],
+            http_method="POST",
+            http_path="/threads",
+            status_code=201,
+            success=True,
+            metadata={"custom_thread_id": bool(body and body.thread_id)},
+        )
 
         # Retornar formato compatible con frontend
         return {
@@ -1594,9 +2163,10 @@ async def get_thread(
 
 @app.get("/threads/{thread_id}/messages", dependencies=[Depends(verify_token_dependency)])
 async def get_thread_messages(
+    http_request: Request,
     thread_id: str,
     limit: int = 200,
-    token_data: dict = Depends(verify_token_dependency)
+    token_data: dict = Depends(verify_token_dependency),
 ):
     """
     Obtiene los mensajes de un thread específico.
@@ -1618,23 +2188,24 @@ async def get_thread_messages(
             )
 
         chat_repo = ChatThreadRepository()
-        messages = chat_repo.get_thread_messages(thread_id, limit=limit, ascending=True)
-
-        # Verificar que el thread pertenece al usuario
-        if messages and messages[0].user_id != user_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="No tienes permiso para acceder a este thread"
-            )
-        # Para threads de asistente (assistant_xxx) sin mensajes, verificar que el asistente pertenece al usuario
-        if not messages and thread_id.startswith("assistant_"):
+        if thread_id.startswith("assistant_"):
             assistant_id = thread_id.replace("assistant_", "", 1)
             assistant_repo = AssistantRepository()
             assistant = assistant_repo.get(assistant_id)
-            if not assistant or assistant.user_id != user_id:
+            if not assistant or not _can_use_assistant(assistant, user_id):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="No tienes permiso para acceder a este asistente"
+                    detail="No tienes permiso para acceder a este asistente",
+                )
+            messages = chat_repo.get_thread_messages(
+                thread_id, limit=limit, ascending=True, user_id=user_id
+            )
+        else:
+            messages = chat_repo.get_thread_messages(thread_id, limit=limit, ascending=True)
+            if messages and messages[0].user_id != user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="No tienes permiso para acceder a este thread",
                 )
 
         # Formatear mensajes para el frontend
@@ -1648,6 +2219,25 @@ async def get_thread_messages(
             }
             for msg in messages
         ]
+
+        track_event(
+            event_category="thread",
+            event_name="api.threads.messages.read",
+            user_id=user_id,
+            request=http_request,
+            thread_id=thread_id,
+            http_method="GET",
+            http_path=f"/threads/{thread_id}/messages",
+            status_code=200,
+            success=True,
+            metrics={
+                "message_count": len(formatted_messages),
+                "limit": limit,
+                "human_count": sum(1 for m in messages if m.role == "Human"),
+                "ai_count": sum(1 for m in messages if m.role == "AI"),
+            },
+            metadata={"is_assistant_thread": thread_id.startswith("assistant_")},
+        )
 
         return {"messages": formatted_messages}
     except HTTPException:

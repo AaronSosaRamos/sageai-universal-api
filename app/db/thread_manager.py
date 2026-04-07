@@ -116,7 +116,20 @@ class ThreadManager:
             True si el thread pertenece al usuario, False en caso contrario
         """
         try:
-            # Obtener el primer mensaje del thread para verificar el user_id
+            # Chat con asistente personalizado: thread_id = "assistant_{uuid}"
+            if thread_id.startswith("assistant_"):
+                from app.db.assistant_management import AssistantRepository
+
+                aid = thread_id.replace("assistant_", "", 1)
+                repo = AssistantRepository(self.supabase_url, self.supabase_key)
+                a = repo.get(aid)
+                if not a:
+                    return False
+                if a.user_id == user_id:
+                    return True
+                # Cualquier usuario puede usar hilos de asistentes ajenos (catálogo global)
+                return True
+
             messages = self.chat_repo.get_thread_messages(thread_id, limit=1)
             if not messages:
                 return False
@@ -357,8 +370,11 @@ class ThreadManager:
             raise ValueError("El thread no pertenece al usuario especificado")
         
         try:
-            # Eliminar mensajes de la base de datos
-            deleted_count = self.chat_repo.delete_thread(thread_id)
+            # Eliminar mensajes de la base de datos (assistant_* puede compartir thread_id entre usuarios)
+            if thread_id.startswith("assistant_"):
+                deleted_count = self.chat_repo.delete_thread_messages_for_user(thread_id, user_id)
+            else:
+                deleted_count = self.chat_repo.delete_thread(thread_id)
             
             # Eliminar directorio de almacenamiento si es necesario
             storage_path = self.storage_base_dir / user_id / thread_id

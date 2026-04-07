@@ -6,7 +6,7 @@ Usa document loaders y LLM para extraer contenido y generar prompts.
 import os
 from typing import List, Tuple
 from langchain_google_genai import ChatGoogleGenerativeAI
-from app.document_loaders import get_docs, FileType
+from app.document_loaders import get_docs
 from app.config import get_settings
 
 
@@ -24,8 +24,14 @@ def _get_file_type(filename: str) -> str:
     ext = os.path.splitext(filename)[1].lower()
     if ext == ".pdf":
         return "pdf"
-    if ext in (".doc", ".docx"):
+    if ext == ".docx":
         return "docx"
+    if ext == ".doc":
+        return "doc"
+    if ext == ".xlsx":
+        return "xlsx"
+    if ext == ".xls":
+        return "xls"
     if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
         return "img"
     return "pdf"  # fallback

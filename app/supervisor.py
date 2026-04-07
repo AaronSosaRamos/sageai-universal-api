@@ -1,3 +1,5 @@
+import time
+
 from app.tools.tools import (
     answer_question_from_file,
     search_scientific_resource,
@@ -11,6 +13,7 @@ from app.tools.tools import (
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
+
 from app.db.chat_management import ChatThreadRepository, ChatMessageCreate
 from app.memory_updater import MemoryUpdater
 from app.db.memory_management import MemoryRepository
@@ -23,6 +26,17 @@ from app.prompt_guard import (
     get_defensive_system_suffix,
     wrap_user_message_for_safety,
 )
+from app.document_loaders import (
+    parse_files_block_from_message,
+    build_file_context_for_llm,
+)
+from app.analytics_helpers import (
+    extract_usage_from_gemini_langchain_messages,
+    extract_usage_from_lc_invoke_response,
+    record_llm_call,
+)
+
+SUPERVISOR_MODEL_NAME = "gemini-3.1-flash-lite-preview"
 
 def get_supervisor_response(
     user_request: str,
@@ -41,7 +55,7 @@ def get_supervisor_response(
     print(f"Pregunta del usuario: {user_request_sanitized[:200]}...")
 
     model = ChatGoogleGenerativeAI(
-        model="gemini-3.1-flash-lite-preview",
+        model=SUPERVISOR_MODEL_NAME,
         temperature=0.75  # Más consistencia pedagógica; sigue siendo conversacional
     )
 
@@ -165,10 +179,11 @@ Files:
 - http://example.com/files/path/file.pdf (File Type: pdf)
 - http://example.com/files/path/image.jpg (File Type: img)
 - http://example.com/files/path/doc.docx (File Type: docx)
+- http://example.com/files/path/legacy.doc (File Type: doc)
 - http://example.com/files/path/sheet.xlsx (File Type: xlsx)
 - http://example.com/files/path/audio.mp3 (File Type: mp3)
 
-TIPOS: pdf, docx, xlsx/xls, img, mp3, url.
+TIPOS: pdf, doc, docx, xlsx, xls, img, mp3, url.
 
 REGLAS:
 1. Mantén el contexto conversacional: usa el historial para responder preguntas sobre mensajes previos.
@@ -191,6 +206,23 @@ REGLAS:
 
     user_input = {"messages": messages}
     response = supervisor.invoke(user_input)
+
+    try:
+        usage = extract_usage_from_gemini_langchain_messages(response.get("messages") or [])
+        if usage.get("input_tokens") is not None or usage.get("output_tokens") is not None:
+            record_llm_call(
+                model_name=SUPERVISOR_MODEL_NAME,
+                user_id=user_id,
+                thread_id=thread_id,
+                assistant_id=None,
+                provider="google",
+                usage=usage,
+                latency_ms=None,
+                metadata={"flow": "supervisor_react_agent", "history_turns": len(history_messages)},
+            )
+    except Exception as ex:
+        print(f"[analytics] supervisor LLM metrics: {ex}")
+
     # Extraer la última respuesta de texto del asistente (puede haber ToolMessages intermedios)
     ai_response = ""
     for msg in reversed(response["messages"]):
@@ -265,26 +297,51 @@ def get_assistant_chat_response(
     """
     Chat con un asistente personalizado. Usa solo el system prompt del asistente,
     sin herramientas. Historial de chat por asistente (thread_id = assistant_{assistant_id}).
+    Si el mensaje incluye el bloque Files: (PDF, Word, Excel), se extrae el texto con
+    langchain-community y se inyecta como contexto antes de la pregunta.
     """
     user_request_sanitized, is_suspicious = sanitize_user_input(user_request)
     if not user_request_sanitized:
         return "Por favor envía un mensaje válido."
 
-    llm_user_message = wrap_user_message_for_safety(user_request_sanitized) if is_suspicious else user_request_sanitized
+    user_text, file_pairs = parse_files_block_from_message(user_request_sanitized)
+    file_context = ""
+    if file_pairs:
+        try:
+            file_context = build_file_context_for_llm(file_pairs, verbose=False)
+        except Exception as e:
+            file_context = f"(No se pudo leer algún archivo adjunto: {e})"
+
+    if file_context:
+        combined_for_llm = (
+            "El usuario adjuntó documentos. Usa SOLO el siguiente contexto extraído de esos archivos "
+            "junto con su pregunta para responder.\n\n"
+            f"{file_context}\n\n"
+            f"---\nPregunta o instrucción del usuario:\n{user_text}"
+        )
+    else:
+        combined_for_llm = user_text if user_text else user_request_sanitized
+
+    llm_user_message = (
+        wrap_user_message_for_safety(combined_for_llm) if is_suspicious else combined_for_llm
+    )
 
     thread_id = f"assistant_{assistant_id}"
     chat_repo = ChatThreadRepository()
-    history_messages = chat_repo.get_thread_messages(thread_id, limit=20, ascending=True)
+    history_messages = chat_repo.get_thread_messages(
+        thread_id, limit=20, ascending=True, user_id=user_id
+    )
 
     model = ChatGoogleGenerativeAI(
-        model="gemini-3.1-flash-lite-preview",
+        model=SUPERVISOR_MODEL_NAME,
         temperature=0.7
     )
 
     defensive_suffix = get_defensive_system_suffix()
     full_system = f"""{system_prompt}
 
-Responde siempre en español. Usa Markdown cuando sea apropiado.{defensive_suffix}"""
+Responde siempre en español. Usa Markdown cuando sea apropiado.
+Si se proporciona contexto de documentos adjuntos, básate en ese contenido para responder.{defensive_suffix}"""
 
     messages = [SystemMessage(content=full_system)]
 
@@ -296,9 +353,32 @@ Responde siempre en español. Usa Markdown cuando sea apropiado.{defensive_suffi
 
     messages.append(HumanMessage(content=llm_user_message))
 
+    t_llm = time.perf_counter()
     response = model.invoke(messages)
+    llm_ms = int((time.perf_counter() - t_llm) * 1000)
     ai_response = response.content if hasattr(response, "content") else str(response)
     ai_response = sanitize_ai_response(ai_response)
+
+    try:
+        usage = extract_usage_from_lc_invoke_response(response)
+        mn = str(usage.pop("model_name", None) or SUPERVISOR_MODEL_NAME)
+        if usage.get("input_tokens") is not None or usage.get("output_tokens") is not None:
+            record_llm_call(
+                model_name=mn,
+                user_id=user_id,
+                thread_id=thread_id,
+                assistant_id=assistant_id,
+                provider="google",
+                usage=usage,
+                latency_ms=llm_ms,
+                metadata={
+                    "flow": "assistant_chat",
+                    "has_attached_file_context": bool(file_context),
+                    "history_turns": len(history_messages),
+                },
+            )
+    except Exception as ex:
+        print(f"[analytics] assistant LLM metrics: {ex}")
 
     chat_repo.create_message(ChatMessageCreate(
         user_id=user_id,

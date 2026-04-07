@@ -2,6 +2,11 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
+# Fuentes DejaVu para exportación PDF (UTF-8 / español)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy requirements first to leverage Docker cache
 COPY requirements.txt .
 

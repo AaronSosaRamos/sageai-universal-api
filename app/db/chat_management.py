@@ -109,17 +109,13 @@ class ChatThreadRepository:
         *,
         limit: int = 200,
         ascending: bool = True,
+        user_id: Optional[str] = None,
     ) -> List[ChatMessage]:
-        order_dir = "asc" if ascending else "desc"
         try:
-            res = (
-                self.client.table(self.table)
-                .select("*")
-                .eq("thread_id", thread_id)
-                .order("created_at", desc=not ascending)
-                .limit(limit)
-                .execute()
-            )
+            q = self.client.table(self.table).select("*").eq("thread_id", thread_id)
+            if user_id is not None:
+                q = q.eq("user_id", user_id)
+            res = q.order("created_at", desc=not ascending).limit(limit).execute()
             return [self._to_chat_message(r) for r in (res.data or [])]
         except APIError as e:
             raise RuntimeError(f"Error al listar mensajes del thread {thread_id}: {e}") from e
@@ -220,6 +216,20 @@ class ChatThreadRepository:
             return len(res.data) if isinstance(res.data, list) else 0
         except APIError as e:
             raise RuntimeError(f"Error al borrar thread {thread_id}: {e}") from e
+
+    def delete_thread_messages_for_user(self, thread_id: str, user_id: str) -> int:
+        """Borra mensajes de un thread solo para un usuario (p. ej. assistant_* compartido)."""
+        try:
+            res = (
+                self.client.table(self.table)
+                .delete()
+                .eq("thread_id", thread_id)
+                .eq("user_id", user_id)
+                .execute()
+            )
+            return len(res.data) if isinstance(res.data, list) else 0
+        except APIError as e:
+            raise RuntimeError(f"Error al borrar mensajes del thread {thread_id}: {e}") from e
 
 # chat_history.py
 from typing import Optional
