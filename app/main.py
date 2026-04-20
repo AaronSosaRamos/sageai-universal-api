@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, status, Depends, Body, Query
 from pydantic import BaseModel, EmailStr, constr
-from datetime import timedelta, datetime
+from datetime import timedelta, datetime, timezone
 from typing import Dict, Literal, Optional
 from .config import get_settings
 from .security import create_access_token
@@ -12,6 +12,22 @@ from .db.thread_manager import ThreadManager, ThreadCreate
 from .db.chat_management import ChatThreadRepository
 from .db.custom_space_management import CustomSpaceRepository, CustomSpaceCreate, CustomSpaceUpdate
 from .db.assistant_management import AssistantRepository, AssistantCreate, AssistantUpdate, Assistant
+from .db.evaluation_management import (
+    EvaluationRepository,
+    EvaluationCreate,
+    EvaluationUpdate,
+    Evaluation,
+    EvaluationAttempt,
+    TakeSession,
+)
+from .evaluation_generator import (
+    generate_evaluation_from_files,
+    strip_questions_for_student,
+    grade_submission,
+    validate_answers_complete,
+    normalize_answers_for_grading,
+    build_submission_review,
+)
 from .db.usage_limits import UsageLimitRepository
 from .assistant_prompt_generator import generate_system_prompt_from_files
 from .response_export import export_markdown
@@ -32,6 +48,7 @@ import shutil
 import asyncio
 import time
 import re
+import statistics as statistics_mod
 from pathlib import Path
 from typing import List, Any
 from unicodedata import normalize
@@ -444,6 +461,15 @@ def _token_user_type(payload: dict) -> str:
     return (payload.get("user_type") or "user").strip().lower()
 
 
+def _require_admin_payload(payload: dict) -> None:
+    """Misma regla que require_admin_dependency, para comprobar dentro del handler."""
+    if _token_user_type(payload) != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Se requiere cuenta de administrador",
+        )
+
+
 def _is_restricted_user(payload: dict) -> bool:
     """Plan 'user': límite diario de interacciones y no puede crear asistentes."""
     return _token_user_type(payload) == "user"
@@ -479,6 +505,40 @@ def _consume_interaction_if_limited(payload: dict) -> None:
 class GeneratePromptRequest(BaseModel):
     file_refs: List[str]  # ["session_uuid/inner_uuid/filename", ...]
     user_hint: str = ""
+
+
+class GenerateEvaluationRequest(BaseModel):
+    file_refs: List[str]
+    requirements: str = ""
+    additional_context: str = ""
+
+
+class EvaluationCreateRequest(BaseModel):
+    title: str
+    description: str = ""
+    requirements_hint: str = ""
+    questions: List[Dict[str, Any]]
+    published: bool = False
+    duration_minutes: Optional[int] = None  # None o 0 = sin límite de tiempo
+
+
+class EvaluationUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    requirements_hint: Optional[str] = None
+    questions: Optional[List[Dict[str, Any]]] = None
+    published: Optional[bool] = None
+    duration_minutes: Optional[int] = None
+
+
+class EvaluationSubmitRequest(BaseModel):
+    answers: Dict[str, Any]
+    session_id: Optional[str] = None  # Obligatorio si la evaluación tiene tiempo límite
+
+
+class StartEvalSessionRequest(BaseModel):
+    evaluation_id: Optional[str] = None
+    share_token: Optional[str] = None
 
 
 class AssistantChatRequest(BaseModel):
@@ -1506,6 +1566,1009 @@ async def delete_assistant(assistant_id: str, payload: dict = Depends(verify_tok
         raise HTTPException(status_code=404, detail="Asistente no encontrado")
     repo.delete(assistant_id)
     return {"message": "Asistente eliminado", "assistant_id": assistant_id}
+
+
+# ---------- Evaluations ----------
+def _track_evaluation_api_event(
+    *,
+    http_request: Optional[Request],
+    event_name: str,
+    user_id: Optional[str],
+    http_method: str,
+    http_path: str,
+    status_code: int = 200,
+    success: bool = True,
+    metadata: Optional[Dict[str, Any]] = None,
+    metrics: Optional[Dict[str, Any]] = None,
+    duration_ms: Optional[int] = None,
+) -> None:
+    """Eventos api.* registrados también en analytics_event_catalog (migración SQL)."""
+    track_event(
+        event_category="api",
+        event_name=event_name,
+        user_id=user_id,
+        request=http_request,
+        http_method=http_method,
+        http_path=http_path,
+        status_code=status_code,
+        duration_ms=duration_ms,
+        success=success,
+        metadata=metadata or {},
+        metrics=metrics or {},
+    )
+
+
+def _payload_participant_snapshot(payload: dict) -> tuple[str, str]:
+    """Email y nombre para mostrar desde el JWT."""
+    email = (payload.get("email") or "").strip()
+    nombre = (payload.get("nombre") or "").strip()
+    apellido = (payload.get("apellido") or "").strip()
+    display = f"{nombre} {apellido}".strip()
+    if not display:
+        display = email
+    if not display:
+        display = str(payload.get("user_id") or "")
+    return email, display
+
+
+def _evaluation_list_item(e: Evaluation, viewer_id: str) -> Dict[str, Any]:
+    is_owner = e.author_user_id == viewer_id
+    return {
+        "id": str(e.id),
+        "title": e.title,
+        "description": e.description,
+        "published": e.published,
+        "author_user_id": e.author_user_id,
+        "is_owner": is_owner,
+        "question_count": len(e.questions_json or []),
+        "created_at": e.created_at.isoformat(),
+        "updated_at": e.updated_at.isoformat(),
+        "published_at": e.published_at.isoformat() if e.published_at else None,
+    }
+
+
+def _evaluation_detail(
+    e: Evaluation,
+    viewer_id: str,
+    *,
+    student_view: bool = False,
+) -> Dict[str, Any]:
+    is_owner = e.author_user_id == viewer_id
+    questions = e.questions_json
+    if student_view:
+        questions = strip_questions_for_student(questions)
+    dm = e.duration_minutes or 0
+    return {
+        "id": str(e.id),
+        "title": e.title,
+        "description": e.description,
+        "requirements_hint": e.requirements_hint if is_owner else "",
+        "published": e.published,
+        "author_user_id": e.author_user_id,
+        "is_owner": is_owner,
+        "questions": questions,
+        "duration_minutes": dm if (e.published or is_owner) else 0,
+        "timed": dm > 0,
+        "share_token": e.share_token if is_owner else None,
+        "created_at": e.created_at.isoformat(),
+        "updated_at": e.updated_at.isoformat(),
+        "published_at": e.published_at.isoformat() if e.published_at else None,
+    }
+
+
+EVAL_SUBMIT_GRACE_SECONDS = 15
+
+
+def _session_deadline_passed(deadline_at: datetime, grace_seconds: int = EVAL_SUBMIT_GRACE_SECONDS) -> bool:
+    now = datetime.now(timezone.utc)
+    dl = deadline_at
+    if dl.tzinfo is None:
+        dl = dl.replace(tzinfo=timezone.utc)
+    return now > dl + timedelta(seconds=grace_seconds)
+
+
+def _resolve_uploaded_paths(user_id: str, file_refs: List[str]) -> List[tuple]:
+    paths: List[tuple] = []
+    for ref in file_refs:
+        parts = ref.split("/")
+        if len(parts) != 3:
+            continue
+        session_uuid, inner_uuid, filename = parts
+        if session_uuid != user_id:
+            raise HTTPException(status_code=403, detail="Archivos no pertenecen al usuario")
+        path = BASE_DIR / session_uuid / inner_uuid / filename
+        if path.exists():
+            paths.append((str(path), filename))
+    return paths
+
+
+@app.post("/evaluations/generate")
+async def generate_evaluation_endpoint(
+    http_request: Request,
+    gen_body: GenerateEvaluationRequest,
+    payload: dict = Depends(require_admin_dependency),
+) -> Dict[str, Any]:
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    t0 = time.perf_counter()
+    try:
+        paths = _resolve_uploaded_paths(user_id, gen_body.file_refs)
+        if not paths:
+            raise HTTPException(status_code=400, detail="No se encontraron archivos válidos")
+        req = (gen_body.requirements or "").strip()
+        extra = (gen_body.additional_context or "").strip()
+        merged = ""
+        if req:
+            merged += "Requisitos y enfoque de la evaluación:\n" + req
+        if extra:
+            if merged:
+                merged += "\n\n---\n\n"
+            merged += "Contexto adicional (audiencia, programa, prioridades, etc.):\n" + extra
+        draft = generate_evaluation_from_files(paths, merged)
+        nq = len((draft or {}).get("questions") or [])
+        _track_evaluation_api_event(
+            http_request=http_request,
+            event_name="evaluation.generate.completed",
+            user_id=str(user_id),
+            http_method="POST",
+            http_path="/evaluations/generate",
+            metadata={
+                "file_ref_count": len(gen_body.file_refs),
+                "question_count": nq,
+                "has_requirements": bool(req),
+                "has_additional_context": bool(extra),
+            },
+            metrics={"duration_ms": int((time.perf_counter() - t0) * 1000)},
+        )
+        return draft
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"Error generando evaluación: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/evaluations", status_code=status.HTTP_201_CREATED)
+async def create_evaluation_endpoint(
+    http_request: Request,
+    body: EvaluationCreateRequest,
+    payload: dict = Depends(require_admin_dependency),
+) -> Dict[str, Any]:
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    if not body.title.strip():
+        raise HTTPException(status_code=400, detail="Título requerido")
+    if not body.questions:
+        raise HTTPException(status_code=400, detail="La evaluación debe incluir preguntas")
+    repo = EvaluationRepository()
+    dm_req = body.duration_minutes
+    dm: Optional[int] = None
+    if dm_req is not None and dm_req > 0:
+        dm = int(dm_req)
+    share_tok = str(uuid.uuid4()) if body.published else None
+    ev = repo.create(
+        EvaluationCreate(
+            author_user_id=user_id,
+            title=body.title.strip(),
+            description=body.description or "",
+            requirements_hint=body.requirements_hint or "",
+            questions_json=body.questions,
+            duration_minutes=dm,
+            share_token=share_tok,
+        )
+    )
+    if body.published:
+        updated = repo.update(ev.id, EvaluationUpdate(published=True))
+        if updated:
+            ev = updated
+            if not ev.share_token:
+                ev = repo.update(ev.id, EvaluationUpdate(share_token=str(uuid.uuid4()))) or ev
+    _track_evaluation_api_event(
+        http_request=http_request,
+        event_name="evaluation.created",
+        user_id=str(user_id),
+        http_method="POST",
+        http_path="/evaluations",
+        metadata={
+            "evaluation_id": str(ev.id),
+            "published": bool(ev.published),
+            "question_count": len(ev.questions_json or []),
+            "duration_minutes": ev.duration_minutes,
+        },
+    )
+    return _evaluation_detail(ev, user_id)
+
+
+@app.get("/evaluations", dependencies=[Depends(verify_token_dependency)])
+async def list_evaluations_endpoint(
+    http_request: Request,
+    scope: str = Query("published", description="mine | published"),
+    payload: dict = Depends(verify_token_dependency),
+) -> Dict[str, Any]:
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    scope_n = (scope or "published").strip().lower()
+    repo = EvaluationRepository()
+    if scope_n == "mine":
+        _require_admin_payload(payload)
+        items = repo.list_by_author(user_id, limit=50, offset=0)
+    elif scope_n == "published":
+        items = repo.list_published(limit=50, offset=0)
+    else:
+        raise HTTPException(status_code=400, detail="scope debe ser mine o published")
+    _track_evaluation_api_event(
+        http_request=http_request,
+        event_name="evaluation.list",
+        user_id=str(user_id),
+        http_method="GET",
+        http_path="/evaluations",
+        metadata={"scope": scope_n, "result_count": len(items)},
+    )
+    return {"items": [_evaluation_list_item(e, user_id) for e in items]}
+
+
+@app.get("/evaluations/{evaluation_id}", dependencies=[Depends(verify_token_dependency)])
+async def get_evaluation_endpoint(
+    http_request: Request,
+    evaluation_id: str,
+    preview_student: bool = Query(
+        False,
+        description="Solo el autor: devuelve preguntas sin solución (vista participante)",
+    ),
+    payload: dict = Depends(verify_token_dependency),
+) -> Dict[str, Any]:
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    repo = EvaluationRepository()
+    ev = repo.get(evaluation_id)
+    if not ev:
+        raise HTTPException(status_code=404, detail="Evaluación no encontrada")
+    is_owner = ev.author_user_id == user_id
+    if not ev.published and not is_owner:
+        raise HTTPException(status_code=404, detail="Evaluación no encontrada")
+    student_view = (not is_owner) or (is_owner and preview_student)
+    _track_evaluation_api_event(
+        http_request=http_request,
+        event_name="evaluation.detail.viewed",
+        user_id=str(user_id),
+        http_method="GET",
+        http_path="/evaluations/{evaluation_id}",
+        metadata={
+            "evaluation_id": evaluation_id,
+            "preview_student": preview_student,
+            "student_view": student_view,
+            "is_owner": is_owner,
+        },
+    )
+    return _evaluation_detail(ev, user_id, student_view=student_view)
+
+
+@app.put("/evaluations/{evaluation_id}")
+async def update_evaluation_endpoint(
+    http_request: Request,
+    evaluation_id: str,
+    body: EvaluationUpdateRequest,
+    payload: dict = Depends(require_admin_dependency),
+) -> Dict[str, Any]:
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    repo = EvaluationRepository()
+    ev = repo.get(evaluation_id)
+    if not ev or ev.author_user_id != user_id:
+        raise HTTPException(status_code=404, detail="Evaluación no encontrada")
+    gen_share: Optional[str] = None
+    if body.published is True and not ev.share_token:
+        gen_share = str(uuid.uuid4())
+    updated = repo.update(
+        evaluation_id,
+        EvaluationUpdate(
+            title=body.title,
+            description=body.description,
+            requirements_hint=body.requirements_hint,
+            questions_json=body.questions,
+            published=body.published,
+            duration_minutes=body.duration_minutes,
+            share_token=gen_share,
+        ),
+    )
+    if not updated:
+        raise HTTPException(status_code=500, detail="No se pudo actualizar")
+    _track_evaluation_api_event(
+        http_request=http_request,
+        event_name="evaluation.updated",
+        user_id=str(user_id),
+        http_method="PUT",
+        http_path="/evaluations/{evaluation_id}",
+        metadata={
+            "evaluation_id": evaluation_id,
+            "published": updated.published,
+            "question_count": len(updated.questions_json or []),
+        },
+    )
+    return _evaluation_detail(updated, user_id)
+
+
+@app.delete("/evaluations/{evaluation_id}")
+async def delete_evaluation_endpoint(
+    http_request: Request,
+    evaluation_id: str,
+    payload: dict = Depends(require_admin_dependency),
+) -> Dict[str, str]:
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    repo = EvaluationRepository()
+    ev = repo.get(evaluation_id)
+    if not ev or ev.author_user_id != user_id:
+        raise HTTPException(status_code=404, detail="Evaluación no encontrada")
+    repo.delete(evaluation_id)
+    _track_evaluation_api_event(
+        http_request=http_request,
+        event_name="evaluation.deleted",
+        user_id=str(user_id),
+        http_method="DELETE",
+        http_path="/evaluations/{evaluation_id}",
+        metadata={"evaluation_id": evaluation_id},
+    )
+    return {"message": "Evaluación eliminada", "evaluation_id": evaluation_id}
+
+
+@app.get("/evaluations/share/{share_token}/meta")
+async def evaluation_share_meta(http_request: Request, share_token: str) -> Dict[str, Any]:
+    """Metadatos públicos (sin autenticación) para la página de enlace compartido."""
+    repo = EvaluationRepository()
+    ev = repo.get_by_share_token(share_token)
+    if not ev or not ev.published:
+        raise HTTPException(status_code=404, detail="Evaluación no disponible")
+    dm = ev.duration_minutes or 0
+    _track_evaluation_api_event(
+        http_request=http_request,
+        event_name="evaluation.share.meta.viewed",
+        user_id=None,
+        http_method="GET",
+        http_path="/evaluations/share/{share_token}/meta",
+        metadata={
+            "evaluation_id": str(ev.id),
+            "timed": dm > 0,
+            "duration_minutes": dm,
+        },
+    )
+    return {
+        "evaluation_id": str(ev.id),
+        "title": ev.title,
+        "description": ev.description,
+        "duration_minutes": dm,
+        "timed": dm > 0,
+    }
+
+
+@app.post("/evaluations/session/start", dependencies=[Depends(verify_token_dependency)])
+async def start_evaluation_session(
+    http_request: Request,
+    body: StartEvalSessionRequest,
+    payload: dict = Depends(verify_token_dependency),
+) -> Dict[str, Any]:
+    """Inicia o reanuda una sesión temporizada; sin tiempo devuelve solo las preguntas."""
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    if bool(body.share_token) == bool(body.evaluation_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Indica exactamente uno: share_token o evaluation_id",
+        )
+    repo = EvaluationRepository()
+    ev: Optional[Evaluation] = None
+    if body.share_token:
+        ev = repo.get_by_share_token(body.share_token.strip())
+    else:
+        ev = repo.get(body.evaluation_id or "")
+    if not ev or not ev.published:
+        raise HTTPException(status_code=404, detail="Evaluación no disponible")
+    questions_student = strip_questions_for_student(ev.questions_json)
+    server_now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    dmin = ev.duration_minutes or 0
+    ev_id_str = str(ev.id)
+    if dmin <= 0:
+        _track_evaluation_api_event(
+            http_request=http_request,
+            event_name="evaluation.session.started",
+            user_id=str(user_id),
+            http_method="POST",
+            http_path="/evaluations/session/start",
+            metadata={
+                "evaluation_id": ev_id_str,
+                "timed": False,
+                "resumed": False,
+                "via_share_token": bool(body.share_token),
+            },
+        )
+        return {
+            "evaluation_id": ev_id_str,
+            "session_id": None,
+            "deadline_at": None,
+            "server_now": server_now,
+            "questions": questions_student,
+            "timed": False,
+            "resumed": False,
+        }
+    repo.close_expired_open_sessions(ev.id, user_id)
+    existing = repo.get_resumable_session(ev.id, user_id)
+    if existing:
+        _track_evaluation_api_event(
+            http_request=http_request,
+            event_name="evaluation.session.started",
+            user_id=str(user_id),
+            http_method="POST",
+            http_path="/evaluations/session/start",
+            metadata={
+                "evaluation_id": ev_id_str,
+                "timed": True,
+                "resumed": True,
+                "session_id": str(existing.id),
+                "via_share_token": bool(body.share_token),
+            },
+        )
+        return {
+            "evaluation_id": ev_id_str,
+            "session_id": str(existing.id),
+            "deadline_at": existing.deadline_at.isoformat().replace("+00:00", "Z"),
+            "server_now": server_now,
+            "questions": questions_student,
+            "timed": True,
+            "resumed": True,
+        }
+    session = repo.create_take_session(ev.id, user_id, dmin)
+    _track_evaluation_api_event(
+        http_request=http_request,
+        event_name="evaluation.session.started",
+        user_id=str(user_id),
+        http_method="POST",
+        http_path="/evaluations/session/start",
+        metadata={
+            "evaluation_id": ev_id_str,
+            "timed": True,
+            "resumed": False,
+            "session_id": str(session.id),
+            "duration_minutes": dmin,
+            "via_share_token": bool(body.share_token),
+        },
+    )
+    return {
+        "evaluation_id": ev_id_str,
+        "session_id": str(session.id),
+        "deadline_at": session.deadline_at.isoformat().replace("+00:00", "Z"),
+        "server_now": server_now,
+        "questions": questions_student,
+        "timed": True,
+        "resumed": False,
+    }
+
+
+@app.post("/evaluations/{evaluation_id}/share/rotate")
+async def rotate_evaluation_share_token(
+    http_request: Request,
+    evaluation_id: str,
+    payload: dict = Depends(require_admin_dependency),
+) -> Dict[str, Any]:
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    repo = EvaluationRepository()
+    ev = repo.get(evaluation_id)
+    if not ev or ev.author_user_id != user_id:
+        raise HTTPException(status_code=404, detail="Evaluación no encontrada")
+    new_tok = str(uuid.uuid4())
+    updated = repo.update(evaluation_id, EvaluationUpdate(share_token=new_tok))
+    if not updated:
+        raise HTTPException(status_code=500, detail="No se pudo actualizar el enlace")
+    _track_evaluation_api_event(
+        http_request=http_request,
+        event_name="evaluation.share.rotated",
+        user_id=str(user_id),
+        http_method="POST",
+        http_path="/evaluations/{evaluation_id}/share/rotate",
+        metadata={"evaluation_id": evaluation_id},
+    )
+    return {"share_token": updated.share_token}
+
+
+@app.post("/evaluations/{evaluation_id}/submit", dependencies=[Depends(verify_token_dependency)])
+async def submit_evaluation_endpoint(
+    http_request: Request,
+    evaluation_id: str,
+    body: EvaluationSubmitRequest,
+    payload: dict = Depends(verify_token_dependency),
+) -> Dict[str, Any]:
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    repo = EvaluationRepository()
+    ev = repo.get(evaluation_id)
+    if not ev or not ev.published:
+        raise HTTPException(status_code=404, detail="Evaluación no disponible")
+    questions = ev.questions_json
+    dmin = ev.duration_minutes or 0
+    take_session_id: Optional[uuid.UUID] = None
+
+    if dmin > 0:
+        if not body.session_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Esta evaluación tiene tiempo límite: inicia sesión con POST /evaluations/session/start",
+            )
+        sess = repo.get_take_session(body.session_id)
+        if (
+            not sess
+            or str(sess.evaluation_id) != str(ev.id)
+            or sess.user_id != user_id
+        ):
+            raise HTTPException(status_code=400, detail="Sesión inválida")
+        if sess.submitted_at is not None:
+            raise HTTPException(status_code=400, detail="Esta sesión ya fue enviada")
+        if _session_deadline_passed(sess.deadline_at):
+            raise HTTPException(
+                status_code=400,
+                detail="El tiempo de la evaluación ha finalizado. No se puede enviar.",
+            )
+        take_session_id = sess.id
+        answers_graded = normalize_answers_for_grading(questions, body.answers)
+    else:
+        try:
+            validate_answers_complete(questions, body.answers)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        answers_graded = body.answers
+
+    now = datetime.now(timezone.utc)
+    duration_seconds: Optional[int] = None
+    seconds_remaining_at_submit: Optional[float] = None
+    started_at: Optional[datetime] = None
+    sess_obj: Optional[TakeSession] = None
+    if take_session_id:
+        sess_obj = repo.get_take_session(take_session_id)
+        if sess_obj:
+            st = sess_obj.started_at
+            if isinstance(st, datetime):
+                started_at = st if st.tzinfo else st.replace(tzinfo=timezone.utc)
+                duration_seconds = max(0, int((now - started_at).total_seconds()))
+            dl = sess_obj.deadline_at
+            if isinstance(dl, datetime):
+                dlx = dl if dl.tzinfo else dl.replace(tzinfo=timezone.utc)
+                seconds_remaining_at_submit = max(0.0, (dlx - now).total_seconds())
+
+    try:
+        score, feedback, per_q, performance_profile = grade_submission(
+            questions,
+            answers_graded,
+            duration_seconds=duration_seconds,
+            time_limit_minutes=dmin if dmin > 0 else None,
+            seconds_remaining_at_submit=seconds_remaining_at_submit,
+        )
+    except Exception as e:
+        print(f"Error calificando evaluación: {e}")
+        raise HTTPException(status_code=500, detail="No se pudo calificar la evaluación")
+
+    review = build_submission_review(questions, answers_graded, per_q)
+
+    p_email, p_name = _payload_participant_snapshot(payload)
+    metrics: Dict[str, Any] = {
+        "per_question_scores": {k: round(float(v), 4) for k, v in per_q.items()},
+        "question_count": len(questions),
+        "timed": dmin > 0,
+        "multiple_choice_count": sum(1 for q in questions if q.get("type") == "multiple_choice"),
+        "open_count": sum(1 for q in questions if q.get("type") == "open"),
+        "performance_profile": performance_profile,
+        "timing_context": {
+            "duration_seconds": duration_seconds,
+            "time_limit_minutes": dmin if dmin > 0 else None,
+            "seconds_remaining_at_submit": seconds_remaining_at_submit,
+        },
+    }
+
+    attempt = repo.insert_attempt(
+        evaluation_id,
+        user_id,
+        answers_graded,
+        score,
+        feedback,
+        take_session_id=take_session_id,
+        participant_email=p_email or None,
+        participant_name=p_name or None,
+        started_at=started_at,
+        duration_seconds=duration_seconds,
+        metrics_json=metrics,
+    )
+    if take_session_id:
+        repo.mark_session_submitted(take_session_id)
+    _track_evaluation_api_event(
+        http_request=http_request,
+        event_name="evaluation.submitted",
+        user_id=str(user_id),
+        http_method="POST",
+        http_path="/evaluations/{evaluation_id}/submit",
+        metadata={
+            "evaluation_id": evaluation_id,
+            "attempt_id": str(attempt.id),
+            "timed": dmin > 0,
+            "session_id": str(take_session_id) if take_session_id else None,
+        },
+        metrics={
+            "score_percent": (
+                float(attempt.score_percent)
+                if attempt.score_percent is not None
+                else None
+            ),
+            "question_count": len(questions),
+            "duration_seconds": (
+                int(attempt.duration_seconds)
+                if attempt.duration_seconds is not None
+                else None
+            ),
+        },
+    )
+    return {
+        "attempt_id": str(attempt.id),
+        "score_percent": attempt.score_percent,
+        "feedback": attempt.feedback,
+        "performance_profile": performance_profile,
+        "review": review,
+        "submitted_at": attempt.created_at.isoformat(),
+        "started_at": attempt.started_at.isoformat() if attempt.started_at else None,
+        "duration_seconds": attempt.duration_seconds,
+        "participant_name": attempt.participant_name,
+        "participant_email": attempt.participant_email,
+        "metrics": metrics,
+    }
+
+
+@app.get("/evaluations/{evaluation_id}/attempts", dependencies=[Depends(verify_token_dependency)])
+async def list_evaluation_attempts_endpoint(
+    http_request: Request,
+    evaluation_id: str,
+    payload: dict = Depends(verify_token_dependency),
+) -> Dict[str, Any]:
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    repo = EvaluationRepository()
+    ev = repo.get(evaluation_id)
+    if not ev:
+        raise HTTPException(status_code=404, detail="Evaluación no encontrada")
+    is_owner = ev.author_user_id == user_id
+    if is_owner:
+        if _token_user_type(payload) == "admin":
+            attempts = repo.list_attempts_for_evaluation(evaluation_id, user_id_filter=None)
+        else:
+            attempts = repo.list_attempts_for_evaluation(evaluation_id, user_id_filter=user_id)
+    else:
+        if not ev.published:
+            raise HTTPException(status_code=404, detail="Evaluación no encontrada")
+        attempts = repo.list_attempts_for_evaluation(evaluation_id, user_id_filter=user_id)
+    _track_evaluation_api_event(
+        http_request=http_request,
+        event_name="evaluation.attempts.listed",
+        user_id=str(user_id),
+        http_method="GET",
+        http_path="/evaluations/{evaluation_id}/attempts",
+        metadata={
+            "evaluation_id": evaluation_id,
+            "is_owner": is_owner,
+            "admin_view_all": is_owner and _token_user_type(payload) == "admin",
+            "result_count": len(attempts),
+        },
+    )
+    out = []
+    for a in attempts:
+        row: Dict[str, Any] = {
+            "id": str(a.id),
+            "score_percent": a.score_percent,
+            "feedback": a.feedback,
+            "created_at": a.created_at.isoformat(),
+            "submitted_at": a.created_at.isoformat(),
+            "started_at": a.started_at.isoformat() if a.started_at else None,
+            "duration_seconds": a.duration_seconds,
+            "participant_email": a.participant_email,
+            "participant_name": a.participant_name,
+            "metrics": a.metrics_json or {},
+        }
+        if is_owner:
+            row["user_id"] = a.user_id
+            row["answers"] = a.answers_json
+        else:
+            row["answers"] = a.answers_json
+        out.append(row)
+    return {"items": out}
+
+
+def _compute_evaluation_analytics_payload(
+    evaluation_id: str,
+    evaluation_title: str,
+    attempts: List[EvaluationAttempt],
+    filtered_user_id: Optional[str],
+) -> Dict[str, Any]:
+    """Agrega métricas desde intentos ya cargados (sin I/O)."""
+
+    def _safe_float(v: Any) -> Optional[float]:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    scores: List[float] = []
+    durations: List[float] = []
+    per_student: List[Dict[str, Any]] = []
+    q_accum: Dict[str, List[float]] = {}
+    radar_accum: Dict[str, List[float]] = {}
+    band_counts: Dict[str, int] = {"0-20": 0, "21-40": 0, "41-60": 0, "61-80": 0, "81-100": 0}
+    mc_attempts: List[float] = []
+    open_attempts: List[float] = []
+    level_counts: Dict[str, int] = {}
+    effort_counts: Dict[str, int] = {}
+    depth_counts: Dict[str, int] = {}
+    pacing_counts: Dict[str, int] = {}
+    timed_count = 0
+
+    for a in attempts:
+        sc = _safe_float(a.score_percent)
+        if sc is not None:
+            scores.append(sc)
+        if a.duration_seconds is not None:
+            durations.append(float(a.duration_seconds))
+
+        mj: Dict[str, Any] = a.metrics_json or {}
+        pp: Dict[str, Any] = mj.get("performance_profile") or {}
+        dc: Dict[str, Any] = pp.get("dashboard_charts") or {}
+        summary_dc: Dict[str, Any] = dc.get("summary") or {}
+        timing_dc: Dict[str, Any] = dc.get("timing") or {}
+
+        if timing_dc.get("is_timed"):
+            timed_count += 1
+
+        mc_avg = summary_dc.get("multiple_choice_avg_percent")
+        op_avg = summary_dc.get("open_avg_percent")
+        if mc_avg is not None:
+            v = _safe_float(mc_avg)
+            if v is not None:
+                mc_attempts.append(v)
+        if op_avg is not None:
+            v = _safe_float(op_avg)
+            if v is not None:
+                open_attempts.append(v)
+
+        for item in dc.get("bar_by_item") or []:
+            qid = item.get("key") or item.get("name") or ""
+            s = _safe_float(item.get("score_percent"))
+            if qid and s is not None:
+                q_accum.setdefault(qid, []).append(s)
+            band = item.get("performance_band") or ""
+            if band == "high":
+                b = "81-100"
+            elif band == "mid":
+                b = "41-60"
+            else:
+                b = "0-20"
+            band_counts[b] = band_counts.get(b, 0) + 1
+
+        for rd in dc.get("radar_dimensions") or []:
+            ak = rd.get("axis_key") or ""
+            v = _safe_float(rd.get("value"))
+            if ak and v is not None:
+                radar_accum.setdefault(ak, []).append(v)
+
+        overall: Dict[str, Any] = pp.get("overall") or {}
+        lvl = str(overall.get("relative_level") or "").lower()
+        if lvl:
+            level_counts[lvl] = level_counts.get(lvl, 0) + 1
+
+        recs: Dict[str, Any] = pp.get("study_recommendations") or {}
+        ef = str(recs.get("estimated_effort_to_improve") or "").lower()
+        if ef:
+            effort_counts[ef] = effort_counts.get(ef, 0) + 1
+
+        pacing: Dict[str, Any] = pp.get("engagement_and_pacing") or {}
+        dp = str(pacing.get("open_response_depth") or "").lower()
+        if dp:
+            depth_counts[dp] = depth_counts.get(dp, 0) + 1
+        ps = str(pacing.get("time_pressure_signal") or "").lower()
+        if ps:
+            pacing_counts[ps] = pacing_counts.get(ps, 0) + 1
+
+        student_row: Dict[str, Any] = {
+            "attempt_id": str(a.id),
+            "user_id": a.user_id,
+            "participant_name": a.participant_name or "",
+            "participant_email": a.participant_email or "",
+            "score_percent": sc,
+            "duration_seconds": a.duration_seconds,
+            "submitted_at": a.created_at.isoformat(),
+            "relative_level": lvl or "unknown",
+            "mc_avg_percent": mc_avg,
+            "open_avg_percent": op_avg,
+            "bar_by_item": dc.get("bar_by_item") or [],
+            "radar_dimensions": dc.get("radar_dimensions") or [],
+            "per_question_scores": mj.get("per_question_scores") or {},
+            "competency_dimensions": pp.get("competency_dimensions") or {},
+            "patterns": pp.get("patterns") or {},
+            "study_recommendations": pp.get("study_recommendations") or {},
+            "engagement_and_pacing": pp.get("engagement_and_pacing") or {},
+            "timing": dc.get("timing") or {},
+        }
+        per_student.append(student_row)
+
+    n = len(attempts)
+    avg_score = (sum(scores) / len(scores)) if scores else None
+    avg_dur = (sum(durations) / len(durations)) if durations else None
+
+    score_stddev = statistics_mod.pstdev(scores) if len(scores) > 1 else 0.0
+
+    bar_by_item_agg = [
+        {
+            "key": qid,
+            "name": qid,
+            "avg_score_percent": round(sum(vals) / len(vals), 2),
+            "sample_n": len(vals),
+        }
+        for qid, vals in sorted(q_accum.items())
+    ]
+
+    radar_agg = [
+        {
+            "subject": {
+                "overall": "Promedio global",
+                "mc_avg": "Opción múltiple (media)",
+                "open_avg": "Respuesta abierta (media)",
+                "consistency": "Consistencia entre ítems",
+            }.get(ak, ak),
+            "axis_key": ak,
+            "value": round(sum(vals) / len(vals), 2),
+            "fullMark": 100,
+        }
+        for ak, vals in radar_accum.items()
+    ]
+
+    histogram = [
+        {"range_label": k, "attempt_count": v, "range_key": k.replace("-", "_")}
+        for k, v in band_counts.items()
+    ]
+
+    score_series = [
+        {
+            "label": f"Int.{i+1}",
+            "score_percent": round(s, 2),
+            "participant": per_student[i].get("participant_name") or per_student[i].get("user_id", "")[:8],
+        }
+        for i, s in enumerate(scores)
+    ]
+
+    return {
+        "evaluation_id": evaluation_id,
+        "evaluation_title": evaluation_title,
+        "filtered_user_id": filtered_user_id,
+        "attempt_count": n,
+        "timed_attempt_count": timed_count,
+        "summary": {
+            "avg_score_percent": round(avg_score, 2) if avg_score is not None else None,
+            "score_stddev": round(score_stddev, 4),
+            "avg_duration_seconds": round(avg_dur, 1) if avg_dur is not None else None,
+            "mc_avg_percent_across_attempts": round(sum(mc_attempts) / len(mc_attempts), 2) if mc_attempts else None,
+            "open_avg_percent_across_attempts": round(sum(open_attempts) / len(open_attempts), 2) if open_attempts else None,
+            "max_score_percent": round(max(scores), 2) if scores else None,
+            "min_score_percent": round(min(scores), 2) if scores else None,
+        },
+        "level_distribution": level_counts,
+        "effort_to_improve_distribution": effort_counts,
+        "open_response_depth_distribution": depth_counts,
+        "time_pressure_distribution": pacing_counts,
+        "bar_by_item_aggregated": bar_by_item_agg,
+        "radar_aggregated": radar_agg,
+        "histogram_score_distribution": histogram,
+        "score_series": score_series,
+        "per_student": per_student,
+    }
+
+
+@app.get("/evaluations/{evaluation_id}/analytics")
+async def evaluation_analytics_endpoint(
+    http_request: Request,
+    evaluation_id: str,
+    user_id_filter: Optional[str] = Query(None, alias="user_id"),
+    payload: dict = Depends(require_admin_dependency),
+) -> Dict[str, Any]:
+    """
+    Agrega métricas de TODOS los intentos de una evaluación para el dashboard.
+    Solo admins. Acepta ?user_id=<id> para filtrar por un participante concreto.
+    Una query lean (sin answers_json).
+    """
+    requester_id = payload.get("user_id") or ""
+    repo = EvaluationRepository()
+    ev = repo.get(evaluation_id)
+    if not ev:
+        raise HTTPException(status_code=404, detail="Evaluación no encontrada")
+
+    attempts = repo.list_attempts_for_evaluation_analytics(
+        evaluation_id,
+        user_id_filter=user_id_filter or None,
+    )
+    result = _compute_evaluation_analytics_payload(
+        str(ev.id),
+        ev.title,
+        attempts,
+        user_id_filter,
+    )
+    _track_evaluation_api_event(
+        http_request=http_request,
+        event_name="evaluation.analytics.viewed",
+        user_id=str(requester_id),
+        http_method="GET",
+        http_path="/evaluations/{evaluation_id}/analytics",
+        metadata={
+            "evaluation_id": evaluation_id,
+            "user_id_filter": user_id_filter,
+            "attempt_count": result["attempt_count"],
+        },
+    )
+    return result
+
+
+@app.get("/admin/evaluations/analytics")
+async def admin_evaluations_analytics_bulk(
+    http_request: Request,
+    payload: dict = Depends(require_admin_dependency),
+) -> Dict[str, Any]:
+    """
+    Todas las evaluaciones del autor + analytics en batch:
+    1 consulta de evaluaciones, 1 consulta de intentos (IN), agregación en memoria.
+    """
+    requester_id = payload.get("user_id") or ""
+    if not requester_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    repo = EvaluationRepository()
+    evals = repo.list_by_author(str(requester_id), limit=50, offset=0)
+    if not evals:
+        return {"items": []}
+
+    eids = [str(e.id) for e in evals]
+    all_attempts = repo.list_attempts_for_evaluations_analytics(eids)
+    by_eval: Dict[str, List[EvaluationAttempt]] = defaultdict(list)
+    for a in all_attempts:
+        by_eval[str(a.evaluation_id)].append(a)
+    for eid in by_eval:
+        by_eval[eid].sort(key=lambda x: x.created_at, reverse=True)
+
+    items: List[Dict[str, Any]] = []
+    total_attempts = 0
+    for ev in evals:
+        eid = str(ev.id)
+        attempts = by_eval.get(eid, [])
+        total_attempts += len(attempts)
+        analytics = _compute_evaluation_analytics_payload(eid, ev.title, attempts, None)
+        items.append(
+            {
+                "evaluation_id": eid,
+                "title": ev.title,
+                "published": ev.published,
+                "created_at": ev.created_at.isoformat(),
+                "analytics": analytics,
+            }
+        )
+
+    _track_evaluation_api_event(
+        http_request=http_request,
+        event_name="evaluation.analytics.bulk_viewed",
+        user_id=str(requester_id),
+        http_method="GET",
+        http_path="/admin/evaluations/analytics",
+        metadata={"evaluation_count": len(evals), "attempt_rows": total_attempts},
+    )
+    return {"items": items}
 
 
 # ---------- Helpers ----------
